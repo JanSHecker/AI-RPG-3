@@ -1,0 +1,8 @@
+{
+  "name": "ai-rpg-3-backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "uvicorn main:app --reload --host localhost --port 8000"
+  }
+}

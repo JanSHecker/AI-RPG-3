@@ -1,0 +1,22 @@
+{
+  "name": "ai-rpg-3-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host localhost --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --host localhost --port 4173"
+  },
+  "dependencies": {
+    "@tanstack/react-table": "^8.21.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "ai-rpg-3": "file:..",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4"
+  }
+}

@@ -1,0 +1,38 @@
+[
+  {
+    "id": "lmstudio:local-model",
+    "label": "LM Studio Local Model",
+    "provider": "lmstudio",
+    "model_name": "local-model"
+  },
+  {
+    "id": "openrouter:minimax/minimax-m2.5:free",
+    "label": "Minimax M2.5 Free",
+    "provider": "openrouter",
+    "model_name": "minimax/minimax-m2.5:free"
+  },
+  {
+    "id": "openrouter:nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "label": "Nemotron 3 Nano Omni Free",
+    "provider": "openrouter",
+    "model_name": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+  },
+  {
+    "id": "openrouter:google/gemma-4-26b-a4b-it:free",
+    "label": "Gemma 4 26B Free",
+    "provider": "openrouter",
+    "model_name": "google/gemma-4-26b-a4b-it:free"
+  },
+  {
+    "id": "openrouter/owl-alpha",
+    "label": "Owl Alpha",
+    "provider": "openrouter",
+    "model_name": "owl-alpha"
+  },
+  {
+    "id": "moonshotai/kimi-k2.6:free",
+    "label": "Kimi K2.6 Free",
+    "provider": "moonshotai",
+    "model_name": "kimi-k2.6:free"
+  }
+]
