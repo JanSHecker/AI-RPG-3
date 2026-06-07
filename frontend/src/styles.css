@@ -1094,7 +1094,11 @@ tbody tr:hover,
 
 .play-main {
   position: relative;
+  display: flex;
+  flex-direction: column;
   min-height: calc(100vh - 150px);
+  max-height: calc(100vh - 150px);
+  overflow: hidden;
 }
 
 .play-main::after {
@@ -1138,9 +1142,11 @@ tbody tr:hover,
 }
 
 .play-log {
+  flex: 1 1 auto;
   max-width: 720px;
-  min-height: 250px;
+  min-height: 0;
   padding: 18px 40px;
+  overflow: auto;
 }
 
 .play-message {
@@ -1164,6 +1170,7 @@ tbody tr:hover,
 }
 
 .play-composer {
+  flex: 0 0 auto;
   gap: 10px;
   padding: 0 40px 24px;
   border-top: 1px solid rgba(143, 150, 160, 0.12);
@@ -1179,12 +1186,57 @@ tbody tr:hover,
   background: rgba(4, 10, 15, 0.62);
 }
 
-.play-input-row textarea {
+.play-command-field {
+  position: relative;
+  min-width: 0;
   min-height: 54px;
+}
+
+.play-command-highlight,
+.play-input-row textarea {
+  width: 100%;
+  min-height: 54px;
+  max-height: 128px;
+  margin: 0;
+  padding: 12px;
   border: 0;
   background: transparent;
   color: #efe9de;
+  font: inherit;
+  line-height: 1.5;
+  overflow: auto;
   resize: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.play-command-highlight {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  color: #efe9de;
+}
+
+.play-command-token {
+  color: #6fca8f;
+}
+
+.play-command-argument {
+  color: #b58a36;
+}
+
+.play-command-completion {
+  color: rgba(239, 233, 222, 0.34);
+}
+
+.play-input-row textarea {
+  position: relative;
+  z-index: 1;
+  caret-color: #efe9de;
+}
+
+.play-input-row textarea.has-highlight {
+  color: transparent;
 }
 
 .play-send {
@@ -1196,30 +1248,10 @@ tbody tr:hover,
   font-size: 13px;
 }
 
-.play-quick-actions {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 8px;
-  padding: 0 120px;
-}
-
-.play-quick-actions button,
 .quest-row,
 .play-list-row {
   border-color: rgba(143, 150, 160, 0.15);
   background: rgba(5, 12, 18, 0.5);
-}
-
-.play-quick-actions button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  min-height: 44px;
-  border: 1px solid rgba(143, 150, 160, 0.15);
-  border-radius: 7px;
-  color: #d8d1c5;
 }
 
 .play-side {
@@ -1397,6 +1429,7 @@ tbody tr:hover,
 
   .play-main {
     min-height: auto;
+    max-height: none;
   }
 
   .job-main {

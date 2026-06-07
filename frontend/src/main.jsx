@@ -1,8 +1,8 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import ReactMarkdown from "react-markdown";
 import { flexRender, getCoreRowModel, getSortedRowModel, useReactTable } from "@tanstack/react-table";
-import { Activity, ArrowLeft, Bed, BookOpen, Check, ChevronRight, Ellipsis, ExternalLink, Eye, Heart, ListChecks, MapPin, MessageSquare, PanelLeftClose, PanelLeftOpen, Play, Plus, RefreshCw, RotateCcw, Send, Shield, Sparkles, Trash2, X } from "lucide-react";
+import { ArrowLeft, BookOpen, Check, ChevronRight, ExternalLink, Eye, Heart, ListChecks, MapPin, MessageSquare, PanelLeftClose, PanelLeftOpen, Play, Plus, RefreshCw, RotateCcw, Send, Shield, Sparkles, Trash2, X } from "lucide-react";
 import "./styles.css";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
@@ -297,6 +297,25 @@ function StepDetailDrawer({ instance, title, onClose }) {
       </aside>
     </div>
   );
+}
+
+function splitCommandInput(value) {
+  if (!value.startsWith("/")) {
+    return { command: "", rest: value };
+  }
+  const match = value.match(/^(\/\S*)([\s\S]*)$/);
+  return {
+    command: match?.[1] ?? value,
+    rest: match?.[2] ?? "",
+  };
+}
+
+function completionSuffix(input, suggestion) {
+  if (!suggestion) return "";
+  if (suggestion.toLowerCase().startsWith(input.toLowerCase())) {
+    return suggestion.slice(input.length);
+  }
+  return "";
 }
 
 function GenerationJobs({ jobs, loading, error, onRefresh, onSelectJob, onOpenWorld, onPlayWorld, onRestartJob, onClearFinished, onClearActive }) {
@@ -820,41 +839,99 @@ function PlayView({
   playState,
   loading,
   error,
-  travelLoading,
-  talkLoading,
+  inputLoading,
   sidebarHidden,
   onToggleSidebar,
   onBackToWorld,
-  onTravel,
-  onTalk,
+  onSubmitInput,
 }) {
-  const [selectedNpcId, setSelectedNpcId] = useState("");
-  const [message, setMessage] = useState("");
+  const [commandInput, setCommandInput] = useState("");
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
+  const highlightRef = useRef(null);
 
   const world = playState?.world;
   const session = playState?.session;
   const character = playState?.character;
   const currentPlace = playState?.current_place;
+  const places = playState?.places ?? [];
   const presentNpcs = playState?.present_npcs ?? [];
+  const conversationNpc = playState?.conversation_npc ?? null;
   const messages = playState?.messages ?? [];
-  const npcById = useMemo(() => new Map(presentNpcs.map((npc) => [npc.id, npc])), [presentNpcs]);
-  const selectedNpc = npcById.get(selectedNpcId) || presentNpcs[0] || null;
+  const mode = session?.mode ?? "default";
+  const isConversation = mode === "conversation";
+  const npcById = useMemo(() => {
+    const rows = conversationNpc ? [...presentNpcs, conversationNpc] : presentNpcs;
+    return new Map(rows.map((npc) => [npc.id, npc]));
+  }, [presentNpcs, conversationNpc]);
+  const suggestions = useMemo(() => {
+    const value = commandInput.trimStart();
+    const lowerValue = value.toLowerCase();
+    if (!value.startsWith("/")) return [];
+
+    if (isConversation) {
+      return "/exit".startsWith(lowerValue) ? [{ label: "/exit", value: "/exit" }] : [];
+    }
+
+    if (lowerValue.startsWith("/travel ")) {
+      const query = lowerValue.slice("/travel ".length).trim();
+      return places
+        .filter((place) => !query || place.name.toLowerCase().includes(query))
+        .slice(0, 6)
+        .map((place) => ({ label: `/travel ${place.name}`, value: `/travel ${place.name}` }));
+    }
+    if (lowerValue.startsWith("/talk ")) {
+      const query = lowerValue.slice("/talk ".length).trim();
+      return presentNpcs
+        .filter((npc) => !query || npc.name.toLowerCase().includes(query))
+        .slice(0, 6)
+        .map((npc) => ({ label: `/talk ${npc.name}`, value: `/talk ${npc.name}` }));
+    }
+    return [
+      { label: "/travel", value: "/travel " },
+      { label: "/talk", value: "/talk " },
+    ].filter((item) => item.label.startsWith(lowerValue));
+  }, [commandInput, isConversation, places, presentNpcs]);
+  const activeSuggestion = suggestions[activeSuggestionIndex] ?? suggestions[0] ?? null;
+  const activeCompletionSuffix = completionSuffix(commandInput, activeSuggestion?.value ?? "");
+  const highlightedInput = splitCommandInput(commandInput);
 
   useEffect(() => {
-    if (presentNpcs.length === 0) {
-      setSelectedNpcId("");
+    if (activeSuggestionIndex >= suggestions.length) {
+      setActiveSuggestionIndex(0);
+    }
+  }, [activeSuggestionIndex, suggestions.length]);
+
+  const submitCommand = async () => {
+    const text = commandInput.trim();
+    if (!text || inputLoading) return;
+    await onSubmitInput(text);
+    setCommandInput("");
+  };
+  const syncHighlightScroll = (event) => {
+    if (!highlightRef.current) return;
+    highlightRef.current.scrollTop = event.currentTarget.scrollTop;
+    highlightRef.current.scrollLeft = event.currentTarget.scrollLeft;
+  };
+  const handleCommandKeyDown = (event) => {
+    if (suggestions.length > 0 && event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveSuggestionIndex((current) => (current + 1) % suggestions.length);
       return;
     }
-    if (!presentNpcs.some((npc) => npc.id === selectedNpcId)) {
-      setSelectedNpcId(presentNpcs[0].id);
+    if (suggestions.length > 0 && event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveSuggestionIndex((current) => (current - 1 + suggestions.length) % suggestions.length);
+      return;
     }
-  }, [presentNpcs, selectedNpcId]);
-
-  const submitTalk = async () => {
-    const text = message.trim();
-    if (!text || !selectedNpc || talkLoading) return;
-    await onTalk(selectedNpc.id, text);
-    setMessage("");
+    if (suggestions.length > 0 && event.key === "Tab") {
+      event.preventDefault();
+      setCommandInput(activeSuggestion?.value ?? commandInput);
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submitCommand().catch(() => {});
+    }
   };
 
   return (
@@ -863,7 +940,7 @@ function PlayView({
         <div>
           <h1>{world?.title ?? "Play"}</h1>
           <div className="muted">
-            {loading ? "Loading play state..." : `${currentPlace?.name ?? "Unknown place"} · ${character?.name ?? "Kaelen Duskborn"}`}
+            {loading ? "Loading play state..." : `${currentPlace?.name ?? "Unknown place"} · ${isConversation && conversationNpc ? `Talking to ${conversationNpc.name}` : "Default mode"} · ${character?.name ?? "Kaelen Duskborn"}`}
           </div>
         </div>
         <div className="header-actions">
@@ -920,25 +997,32 @@ function PlayView({
             </div>
 
             <div className="play-composer">
-              <div className="field-label">Talk to {selectedNpc?.name ?? "an NPC"}</div>
+              <div className="field-label">{isConversation && conversationNpc ? `Talking to ${conversationNpc.name}` : "Default mode"}</div>
               <div className="play-input-row">
-                <textarea
-                  value={message}
-                  onChange={(event) => setMessage(event.target.value)}
-                  placeholder={selectedNpc ? `Say something to ${selectedNpc.name}...` : "No NPCs are present here."}
-                  rows={3}
-                  disabled={!selectedNpc || talkLoading}
-                />
-                <button className="icon-button play-send" type="button" onClick={() => submitTalk().catch(() => {})} disabled={!selectedNpc || !message.trim() || talkLoading}>
-                  {talkLoading ? <RefreshCw size={16} /> : <Send size={16} />}
+                <div className="play-command-field">
+                  <pre className="play-command-highlight" ref={highlightRef} aria-hidden="true">
+                    {highlightedInput.command ? <span className="play-command-token">{highlightedInput.command}</span> : null}
+                    {highlightedInput.rest ? <span className="play-command-argument">{highlightedInput.rest}</span> : null}
+                    {activeCompletionSuffix ? <span className="play-command-completion">{activeCompletionSuffix}</span> : null}
+                  </pre>
+                  <textarea
+                    className={commandInput ? "has-highlight" : ""}
+                    value={commandInput}
+                    onChange={(event) => {
+                      setCommandInput(event.target.value);
+                      setActiveSuggestionIndex(0);
+                    }}
+                    onKeyDown={handleCommandKeyDown}
+                    onScroll={syncHighlightScroll}
+                    placeholder={isConversation && conversationNpc ? `Say something to ${conversationNpc.name} or type /exit` : "Type /travel <place> or /talk <character>"}
+                    rows={3}
+                    spellCheck="false"
+                    disabled={inputLoading}
+                  />
+                </div>
+                <button className="icon-button play-send" type="button" onClick={() => submitCommand().catch(() => {})} disabled={!commandInput.trim() || inputLoading}>
+                  {inputLoading ? <RefreshCw size={16} /> : <Send size={16} />}
                 </button>
-              </div>
-              <div className="play-helper-text">The AI will interpret your input and respond to the outcome.</div>
-              <div className="play-quick-actions">
-                <button type="button"><Eye size={17} /> Look Around</button>
-                <button type="button"><Activity size={17} /> Check Status</button>
-                <button type="button"><Bed size={17} /> Rest</button>
-                <button type="button"><Ellipsis size={17} /> More Actions</button>
               </div>
             </div>
           </div>
@@ -994,8 +1078,7 @@ function App() {
   const [playWorldId, setPlayWorldId] = useState(initialRoute.playWorldId);
   const [playState, setPlayState] = useState(null);
   const [playLoading, setPlayLoading] = useState(false);
-  const [travelLoading, setTravelLoading] = useState(false);
-  const [talkLoading, setTalkLoading] = useState(false);
+  const [playInputLoading, setPlayInputLoading] = useState(false);
   const [sidebarHidden, setSidebarHidden] = useState(initialRoute.mode === "play");
   const [world, setWorld] = useState(null);
   const [data, setData] = useState({ places: [], npcs: [], factions: [], items: [], inventory: [], relationships: [] });
@@ -1313,48 +1396,22 @@ function App() {
     await loadGenerationJobs();
   };
 
-  const travelPlay = async (placeId) => {
+  const submitPlayInput = async (input) => {
     if (!playWorldId) return;
-    setTravelLoading(true);
+    setPlayInputLoading(true);
     setError("");
     try {
-      const payload = await request(`/worlds/${encodeURIComponent(playWorldId)}/play/travel`, {
+      const payload = await request(`/worlds/${encodeURIComponent(playWorldId)}/play/input`, {
         method: "POST",
-        body: JSON.stringify({ place_id: placeId }),
+        body: JSON.stringify({ input }),
       });
       setPlayState(payload);
-    } catch (travelError) {
-      setError(travelError.message);
-    } finally {
-      setTravelLoading(false);
-    }
-  };
-
-  const talkToNpc = async (npcId, text) => {
-    if (!playWorldId) return;
-    const optimisticMessage = {
-      id: `pending-${Date.now()}`,
-      session_id: playState?.session?.id ?? "",
-      kind: "player",
-      npc_id: npcId,
-      content: text,
-      created_at: new Date().toISOString(),
-    };
-    setPlayState((current) => current ? { ...current, messages: [...(current.messages ?? []), optimisticMessage] } : current);
-    setTalkLoading(true);
-    setError("");
-    try {
-      const payload = await request(`/worlds/${encodeURIComponent(playWorldId)}/play/talk`, {
-        method: "POST",
-        body: JSON.stringify({ npc_id: npcId, message: text }),
-      });
-      setPlayState(payload);
-    } catch (talkError) {
-      setError(talkError.message);
+    } catch (inputError) {
+      setError(inputError.message);
       await loadPlayState(playWorldId).catch(() => {});
-      throw talkError;
+      throw inputError;
     } finally {
-      setTalkLoading(false);
+      setPlayInputLoading(false);
     }
   };
 
@@ -1421,13 +1478,11 @@ function App() {
           playState={playState}
           loading={playLoading}
           error={error}
-          travelLoading={travelLoading}
-          talkLoading={talkLoading}
+          inputLoading={playInputLoading}
           sidebarHidden={sidebarHidden}
           onToggleSidebar={() => setSidebarHidden((current) => !current)}
           onBackToWorld={(worldId) => loadWorld(worldId).catch((loadError) => setError(loadError.message))}
-          onTravel={(placeId) => travelPlay(placeId)}
-          onTalk={(npcId, text) => talkToNpc(npcId, text)}
+          onSubmitInput={(input) => submitPlayInput(input)}
         />
       ) : mode === "detail" && world ? (
         <WorldDetail

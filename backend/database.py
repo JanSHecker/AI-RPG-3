@@ -158,6 +158,8 @@ CREATE TABLE IF NOT EXISTS play_sessions (
     character_name TEXT NOT NULL,
     character_summary TEXT NOT NULL,
     current_place_id TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'default',
+    conversation_npc_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -197,12 +199,23 @@ def connect(path: Optional[Path] = None) -> sqlite3.Connection:
 def init_db(path: Optional[Path] = None) -> None:
     with connect(path) as conn:
         conn.executescript(SCHEMA)
-        columns = {
+        generation_step_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(generation_job_steps)").fetchall()
         }
-        if "prompt_messages" not in columns:
+        if "prompt_messages" not in generation_step_columns:
             conn.execute("ALTER TABLE generation_job_steps ADD COLUMN prompt_messages TEXT NOT NULL DEFAULT '[]'")
+
+        play_session_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(play_sessions)").fetchall()
+        }
+        if "mode" not in play_session_columns:
+            conn.execute("DELETE FROM play_sessions")
+            conn.execute("ALTER TABLE play_sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'default'")
+        if "conversation_npc_id" not in play_session_columns:
+            conn.execute("DELETE FROM play_sessions")
+            conn.execute("ALTER TABLE play_sessions ADD COLUMN conversation_npc_id TEXT")
 
 
 @contextmanager

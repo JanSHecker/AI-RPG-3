@@ -6,15 +6,15 @@ from pydantic import BaseModel
 
 from database import init_db
 from model_catalog import ConfiguredModel, find_model, load_model_catalog, resolve_active_model, save_active_model_id
+from play import PlayInputError, submit_play_input
 from providers import ProviderError, chat_completion
 from play_repository import (
-    append_play_message,
     get_faction,
     get_npc_for_play,
     get_play_state,
     list_npc_relationships,
     lore_excerpt,
-    travel_play_session,
+    set_conversation_mode,
 )
 from world_repository import (
     delete_world,
@@ -72,6 +72,10 @@ class PlayTravelRequest(BaseModel):
 class PlayTalkRequest(BaseModel):
     npc_id: str
     message: str
+
+
+class PlayInputRequest(BaseModel):
+    input: str
 
 
 def build_npc_dialogue_messages(world_id: str, npc_id: str, player_message: str) -> list[dict[str, str]]:
@@ -290,10 +294,36 @@ async def api_get_play_state(world_id: str):
 @router.post("/worlds/{world_id}/play/travel")
 async def api_play_travel(world_id: str, request: PlayTravelRequest):
     try:
-        return travel_play_session(world_id, request.place_id)
-    except ValueError as exc:
+        return await submit_play_input(world_id, f"/travel {request.place_id}", _npc_reply_factory(world_id))
+    except PlayInputError as exc:
         status_code = 404 if "not found" in str(exc).lower() else 400
         raise HTTPException(status_code=status_code, detail=str(exc))
+
+
+def _npc_reply_factory(world_id: str):
+    async def reply(npc_id: str, message: str) -> str:
+        model = resolve_active_model()
+        reply_text, _latency_ms = await chat_completion(
+            model,
+            build_npc_dialogue_messages(world_id, npc_id, message),
+            temperature=0.8,
+        )
+        return reply_text
+
+    return reply
+
+
+@router.post("/worlds/{world_id}/play/input")
+async def api_play_input(world_id: str, request: PlayInputRequest):
+    try:
+        return await submit_play_input(world_id, request.input, _npc_reply_factory(world_id))
+    except PlayInputError as exc:
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc))
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=f"NPC response failed: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"NPC response failed: {exc}")
 
 
 @router.post("/worlds/{world_id}/play/talk")
@@ -304,24 +334,19 @@ async def api_play_talk(world_id: str, request: PlayTalkRequest):
     if not get_npc_for_play(world_id, request.npc_id):
         raise HTTPException(status_code=404, detail="NPC not found in this world.")
 
-    append_play_message(world_id, "player", message, request.npc_id)
+    state = get_play_state(world_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="World not found.")
     try:
-        model = resolve_active_model()
-        reply, _latency_ms = await chat_completion(
-            model,
-            build_npc_dialogue_messages(world_id, request.npc_id, message),
-            temperature=0.8,
-        )
-        append_play_message(world_id, "npc", reply, request.npc_id)
+        if state["session"].get("mode") != "conversation" or state["session"].get("conversation_npc_id") != request.npc_id:
+            set_conversation_mode(world_id, request.npc_id)
+        return await submit_play_input(world_id, message, _npc_reply_factory(world_id))
+    except PlayInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=f"NPC response failed: {exc}")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"NPC response failed: {exc}")
-
-    state = get_play_state(world_id)
-    if not state:
-        raise HTTPException(status_code=404, detail="World not found.")
-    return state
 
 
 @router.delete("/worlds/{world_id}", status_code=204)

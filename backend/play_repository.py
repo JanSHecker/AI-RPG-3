@@ -1,4 +1,5 @@
 import json
+import random
 from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
@@ -35,6 +36,22 @@ def _first_place(world_id: str) -> Optional[dict[str, Any]]:
     return row_to_dict(row) if row else None
 
 
+def _random_populated_place(world_id: str) -> Optional[dict[str, Any]]:
+    with db_session() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT places.* FROM places
+            JOIN npcs ON npcs.current_place_id = places.id
+            WHERE places.world_id = ?
+              AND npcs.world_id = ?
+            ORDER BY places.name
+            """,
+            (world_id, world_id),
+        ).fetchall()
+    places = [row_to_dict(row) for row in rows]
+    return random.SystemRandom().choice(places) if places else None
+
+
 def _get_session(world_id: str) -> Optional[dict[str, Any]]:
     with db_session() as conn:
         row = conn.execute("SELECT * FROM play_sessions WHERE world_id = ?", (world_id,)).fetchone()
@@ -49,7 +66,7 @@ def ensure_play_session(world_id: str) -> dict[str, Any]:
     if not get_world(world_id):
         raise ValueError("World not found.")
 
-    place = _first_place(world_id)
+    place = _random_populated_place(world_id) or _first_place(world_id)
     if not place:
         raise ValueError("World has no places to explore.")
 
@@ -60,8 +77,8 @@ def ensure_play_session(world_id: str) -> dict[str, Any]:
         conn.execute(
             """
             INSERT INTO play_sessions
-                (id, world_id, character_name, character_summary, current_place_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, world_id, character_name, character_summary, current_place_id, mode, conversation_npc_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -69,6 +86,8 @@ def ensure_play_session(world_id: str) -> dict[str, Any]:
                 TEST_CHARACTER["name"],
                 TEST_CHARACTER["summary"],
                 place["id"],
+                "default",
+                None,
                 timestamp,
                 timestamp,
             ),
@@ -94,6 +113,18 @@ def _list_npcs(world_id: str) -> list[dict[str, Any]]:
     with db_session() as conn:
         rows = conn.execute("SELECT * FROM npcs WHERE world_id = ? ORDER BY name", (world_id,)).fetchall()
     return [_parse_npc(row_to_dict(row)) for row in rows]
+
+
+def list_places_for_play(world_id: str) -> list[dict[str, Any]]:
+    return _list_places(world_id)
+
+
+def list_present_npcs_for_play(world_id: str) -> list[dict[str, Any]]:
+    session = ensure_play_session(world_id)
+    return [
+        npc for npc in _list_npcs(world_id)
+        if npc.get("current_place_id") == session.get("current_place_id")
+    ]
 
 
 def _list_messages(session_id: str, limit: int = 80) -> list[dict[str, Any]]:
@@ -127,6 +158,10 @@ def get_play_state(world_id: str) -> Optional[dict[str, Any]]:
         npc for npc in npcs
         if npc.get("current_place_id") == session.get("current_place_id")
     ]
+    conversation_npc = next(
+        (npc for npc in npcs if npc.get("id") == session.get("conversation_npc_id")),
+        None,
+    )
 
     return {
         "world": world,
@@ -138,6 +173,7 @@ def get_play_state(world_id: str) -> Optional[dict[str, Any]]:
         "current_place": current_place,
         "places": places,
         "present_npcs": present_npcs,
+        "conversation_npc": conversation_npc,
         "messages": _list_messages(session["id"]),
     }
 
@@ -155,7 +191,11 @@ def travel_play_session(world_id: str, place_id: str) -> dict[str, Any]:
         place_row = row_to_dict(place)
         timestamp = now_iso()
         conn.execute(
-            "UPDATE play_sessions SET current_place_id = ?, updated_at = ? WHERE id = ?",
+            """
+            UPDATE play_sessions
+            SET current_place_id = ?, mode = 'default', conversation_npc_id = NULL, updated_at = ?
+            WHERE id = ?
+            """,
             (place_id, timestamp, session["id"]),
         )
         content = f"You travel to {place_row['name']}. {place_row.get('summary', '')}".strip()
@@ -167,6 +207,42 @@ def travel_play_session(world_id: str, place_id: str) -> dict[str, Any]:
             (f"msg-{uuid4().hex[:12]}", session["id"], "travel", None, content, timestamp),
         )
 
+    state = get_play_state(world_id)
+    if state is None:
+        raise ValueError("World not found.")
+    return state
+
+
+def set_conversation_mode(world_id: str, npc_id: str) -> dict[str, Any]:
+    session = ensure_play_session(world_id)
+    timestamp = now_iso()
+    with db_session() as conn:
+        conn.execute(
+            """
+            UPDATE play_sessions
+            SET mode = 'conversation', conversation_npc_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (npc_id, timestamp, session["id"]),
+        )
+    state = get_play_state(world_id)
+    if state is None:
+        raise ValueError("World not found.")
+    return state
+
+
+def set_default_mode(world_id: str) -> dict[str, Any]:
+    session = ensure_play_session(world_id)
+    timestamp = now_iso()
+    with db_session() as conn:
+        conn.execute(
+            """
+            UPDATE play_sessions
+            SET mode = 'default', conversation_npc_id = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (timestamp, session["id"]),
+        )
     state = get_play_state(world_id)
     if state is None:
         raise ValueError("World not found.")

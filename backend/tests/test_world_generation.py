@@ -210,11 +210,82 @@ def test_schema_initializes_play_tables(tmp_path):
             row[0]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(play_sessions)").fetchall()}
     finally:
         conn.close()
 
     assert "play_sessions" in tables
     assert "play_messages" in tables
+    assert {"mode", "conversation_npc_id"}.issubset(columns)
+
+
+def test_play_session_schema_migration_resets_existing_sessions(tmp_path, monkeypatch):
+    db_path = tmp_path / "world.sqlite3"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript(
+            """
+            CREATE TABLE worlds (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                title TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE play_sessions (
+                id TEXT PRIMARY KEY,
+                world_id TEXT NOT NULL UNIQUE REFERENCES worlds(id) ON DELETE CASCADE,
+                character_name TEXT NOT NULL,
+                character_summary TEXT NOT NULL,
+                current_place_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE play_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES play_sessions(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                npc_id TEXT,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO worlds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("world-old", "prompt", "Old World", 1, "done", "test", "test", "now", "now"),
+        )
+        conn.execute(
+            "INSERT INTO play_sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("play-old", "world-old", "Name", "Summary", "place-old", "now", "now"),
+        )
+        conn.execute(
+            "INSERT INTO play_messages VALUES (?, ?, ?, ?, ?, ?)",
+            ("msg-old", "play-old", "system", None, "old", "now"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    init_db()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(play_sessions)").fetchall()}
+        session_count = conn.execute("SELECT COUNT(*) FROM play_sessions").fetchone()[0]
+        message_count = conn.execute("SELECT COUNT(*) FROM play_messages").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert {"mode", "conversation_npc_id"}.issubset(columns)
+    assert session_count == 0
+    assert message_count == 0
 
 
 def test_schema_adds_prompt_messages_to_existing_job_steps_table(tmp_path):
@@ -634,8 +705,12 @@ def test_play_state_api_creates_session(tmp_path, monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["session"]["world_id"] == world_id
+    assert payload["session"]["mode"] == "default"
+    assert payload["session"]["conversation_npc_id"] is None
     assert payload["character"]["name"] == "Kaelen Duskborn"
     assert payload["current_place"]["id"] in {place["id"] for place in payload["places"]}
+    assert payload["present_npcs"]
+    assert payload["current_place"]["id"] in {npc["current_place_id"] for npc in payload["present_npcs"]}
     assert payload["messages"][0]["kind"] == "system"
 
 
@@ -664,6 +739,149 @@ def test_play_travel_rejects_invalid_place_and_updates_location(tmp_path, monkey
     payload = accepted.json()
     assert payload["session"]["current_place_id"] == first_place["id"]
     assert payload["messages"][-1]["kind"] == "travel"
+
+
+def test_play_input_default_free_form_is_noop(tmp_path, monkeypatch):
+    import api
+
+    db_path = tmp_path / "world.sqlite3"
+    worlds_path = tmp_path / "worlds"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    monkeypatch.setattr(settings, "worlds_dir", str(worlds_path))
+    RUNNING_TASKS.clear()
+    init_db()
+    world_id = insert_world("A quiet road market", sample_model(), sample_world_draft(), "{}", 0)
+
+    async def unexpected_chat_completion(*args, **kwargs):
+        raise AssertionError("Default free-form input should not call the LLM.")
+
+    monkeypatch.setattr(api, "chat_completion", unexpected_chat_completion)
+
+    with TestClient(app) as client:
+        before = client.get(f"/worlds/{world_id}/play").json()
+        response = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": "I look around the square."},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["session"]["mode"] == "default"
+    assert payload["messages"] == before["messages"]
+
+
+def test_play_input_travel_and_talk_commands_change_state(tmp_path, monkeypatch):
+    db_path = tmp_path / "world.sqlite3"
+    worlds_path = tmp_path / "worlds"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    monkeypatch.setattr(settings, "worlds_dir", str(worlds_path))
+    RUNNING_TASKS.clear()
+    init_db()
+    world_id = insert_world("A road of lantern posts", sample_model(), sample_world_draft(), "{}", 0)
+
+    with TestClient(app) as client:
+        state = client.get(f"/worlds/{world_id}/play").json()
+        npc_place_ids = {npc["current_place_id"] for npc in list_table(world_id, "npcs")}
+        destination = next(
+            place for place in state["places"]
+            if place["id"] != state["current_place"]["id"] and place["id"] in npc_place_ids
+        )
+        travelled = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": f"/travel {destination['name']}"},
+        )
+        state = travelled.json()
+        npc = state["present_npcs"][0]
+        talked = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": f"/talk {npc['name']}"},
+        )
+
+    assert travelled.status_code == 200
+    assert state["session"]["current_place_id"] == destination["id"]
+    assert state["session"]["mode"] == "default"
+    assert talked.status_code == 200
+    payload = talked.json()
+    assert payload["session"]["mode"] == "conversation"
+    assert payload["session"]["conversation_npc_id"] == npc["id"]
+    assert payload["conversation_npc"]["id"] == npc["id"]
+    assert payload["messages"][-1]["kind"] == "system"
+
+
+def test_play_input_conversation_dialogue_and_exit(tmp_path, monkeypatch):
+    import api
+
+    db_path = tmp_path / "world.sqlite3"
+    worlds_path = tmp_path / "worlds"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    monkeypatch.setattr(settings, "worlds_dir", str(worlds_path))
+    RUNNING_TASKS.clear()
+    init_db()
+    world_id = insert_world("A market beneath red awnings", sample_model(), sample_world_draft(), "{}", 0)
+    captured = {}
+
+    async def fake_chat_completion(model, messages, temperature=None, response_format=None):
+        captured["messages"] = messages
+        return "The west gate closes before dusk.", 12
+
+    monkeypatch.setattr(api, "chat_completion", fake_chat_completion)
+
+    with TestClient(app) as client:
+        state = client.get(f"/worlds/{world_id}/play").json()
+        npc = state["present_npcs"][0]
+        entered = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": f"/talk {npc['name']}"},
+        )
+        blocked = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": f"/travel {state['places'][0]['name']}"},
+        )
+        replied = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": "What should I know?"},
+        )
+        exited = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": "/exit"},
+        )
+
+    assert entered.status_code == 200
+    assert blocked.status_code == 400
+    assert replied.status_code == 200
+    reply_payload = replied.json()
+    assert reply_payload["session"]["mode"] == "conversation"
+    assert reply_payload["messages"][-2]["kind"] == "player"
+    assert reply_payload["messages"][-1]["kind"] == "npc"
+    assert "What should I know?" in captured["messages"][1]["content"]
+    assert exited.status_code == 200
+    exit_payload = exited.json()
+    assert exit_payload["session"]["mode"] == "default"
+    assert exit_payload["session"]["conversation_npc_id"] is None
+    assert exit_payload["messages"][-1]["kind"] == "system"
+
+
+def test_play_input_rejects_invalid_commands(tmp_path, monkeypatch):
+    db_path = tmp_path / "world.sqlite3"
+    worlds_path = tmp_path / "worlds"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    monkeypatch.setattr(settings, "worlds_dir", str(worlds_path))
+    RUNNING_TASKS.clear()
+    init_db()
+    world_id = insert_world("A hill road without good signs", sample_model(), sample_world_draft(), "{}", 0)
+
+    with TestClient(app) as client:
+        missing_place = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": "/travel Nowhere"},
+        )
+        missing_npc = client.post(
+            f"/worlds/{world_id}/play/input",
+            json={"input": "/talk Nobody"},
+        )
+
+    assert missing_place.status_code == 400
+    assert missing_npc.status_code == 400
 
 
 def test_play_talk_uses_llm_and_stores_messages(tmp_path, monkeypatch):
