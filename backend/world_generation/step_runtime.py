@@ -19,6 +19,7 @@ STEP_LABELS = {
     "factions": "Factions",
     "location_plan": "Location Plan",
     "villages_places": "Villages & Places",
+    "character_diagram": "Character Diagram",
     "npcs": "NPCs",
     "relationships": "Relationships",
 }
@@ -98,7 +99,7 @@ async def update_step(updater: Optional[StepUpdater], step_name: str, status: st
 
 def validation_text(exc: Exception) -> str:
     if isinstance(exc, ValidationError):
-        return json.dumps(exc.errors(), ensure_ascii=False)[:4000]
+        return json.dumps(exc.errors(), ensure_ascii=False, default=str)[:4000]
     return str(exc)[:4000]
 
 
@@ -129,14 +130,15 @@ async def run_structured_step(
     transcript = StepTranscript(name=step_name, label=step_label(step_name))
 
     for attempt in range(1, MAX_STEP_ATTEMPTS + 1):
-        await update_step(updater, step_name, "running", attempts=attempt, error="")
+        messages = build_messages(previous_error, previous_response)
+        await update_step(updater, step_name, "running", attempts=attempt, error="", prompt_messages=messages)
         text = ""
         try:
             text, latency_ms = await CHAT_ADAPTER.complete_json(
                 model=model,
                 step_name=step_name,
                 schema=schema,
-                messages=build_messages(previous_error, previous_response),
+                messages=messages,
             )
             payload = parse_json_object(text)
             parsed = schema.model_validate(payload)

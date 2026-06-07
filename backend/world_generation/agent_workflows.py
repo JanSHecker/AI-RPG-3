@@ -8,7 +8,7 @@ from typing import Any, Optional
 from model_catalog import ConfiguredModel
 from providers import ProviderError, chat_completion, strict_json_schema
 from world_generation.agent_framework_compat import AGENT_FRAMEWORK_AVAILABLE, workflow
-from world_generation.prompts import create_faction, create_items, create_location_plan, create_npc, create_region, create_relationships, create_village
+from world_generation.prompts import create_character_diagram, create_faction, create_items, create_location_plan, create_npc, create_region, create_relationships, create_village
 from world_generation.prompts.create_faction import FactionsStep
 from world_generation.prompts.create_items import WorldItemsStep
 from world_generation.prompts.create_npc import NPCStep
@@ -16,7 +16,10 @@ from world_generation.prompts.create_region import RegionStep
 from world_generation.prompts.create_relationships import RelationshipsStep
 from world_generation.prompts.create_village import PlacesStep
 from world_generation.schemas import (
+    CharacterSegmentDraft,
+    CharacterDiagramStep,
     LocationPlanStep,
+    RelationshipOpportunityDraft,
     WorldDraft,
     WorldItemDraft,
 )
@@ -64,6 +67,9 @@ class WorldGenerationState:
     places_step: Optional[PlacesStep] = None
     factions_step: Optional[FactionsStep] = None
     location_plan_step: Optional[LocationPlanStep] = None
+    character_diagram_step: Optional[CharacterDiagramStep] = None
+    character_segments: list[CharacterSegmentDraft] = field(default_factory=list)
+    relationship_opportunities: list[RelationshipOpportunityDraft] = field(default_factory=list)
     npc_step: Optional[NPCStep] = None
     relationships_step: Optional[RelationshipsStep] = None
 
@@ -97,6 +103,7 @@ async def world_generation_workflow(state: WorldGenerationState) -> WorldGenerat
     state = await create_faction.run_step(state)
     state = await create_location_plan.run_step(state)
     state = await create_village.run_step(state)
+    state = await create_character_diagram.run_step(state)
     state = await create_npc.run_step(state)
     state = await create_relationships.run_step(state)
     return state
@@ -122,6 +129,7 @@ async def build_world_draft(
         or final_state.location_plan_step is None
         or final_state.places_step is None
         or final_state.factions_step is None
+        or final_state.character_diagram_step is None
         or final_state.npc_step is None
         or final_state.relationships_step is None
     ):
@@ -141,6 +149,9 @@ async def build_world_draft(
             "pipeline_version": PIPELINE_VERSION,
             "steps": transcript_payloads(final_state.step_transcripts),
             "location_plan": final_state.location_plan_step.model_dump(),
+            "character_diagram": final_state.character_diagram_step.model_dump(),
+            "character_segments": [segment.model_dump() for segment in final_state.character_segments],
+            "relationship_opportunities": [opportunity.model_dump() for opportunity in final_state.relationship_opportunities],
             "final_world": draft.model_dump(),
         },
         ensure_ascii=False,

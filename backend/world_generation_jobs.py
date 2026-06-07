@@ -52,6 +52,11 @@ def _decode_step(row) -> dict[str, Any]:
     data = _row_to_dict(row)
     data["attempts"] = int(data.get("attempts") or 0)
     data["latency_ms"] = data.get("latency_ms")
+    try:
+        prompt_messages = json.loads(data.get("prompt_messages") or "[]")
+    except json.JSONDecodeError:
+        prompt_messages = []
+    data["prompt_messages"] = prompt_messages if isinstance(prompt_messages, list) else []
     return data
 
 
@@ -112,6 +117,7 @@ def restart_generation_job(job_id: str, model: ConfiguredModel) -> Optional[dict
             SET status = 'pending',
                 attempts = 0,
                 error = '',
+                prompt_messages = '[]',
                 raw_response = '',
                 parsed_payload = '',
                 latency_ms = NULL,
@@ -227,6 +233,8 @@ async def update_job_step(job_id: str, step_name: str, status: str, payload: dic
     finished_at = timestamp if status in {"done", "failed"} else None
     parsed_payload = payload.get("parsed_payload")
     parsed_text = json.dumps(parsed_payload, ensure_ascii=False) if parsed_payload is not None else None
+    prompt_messages = payload.get("prompt_messages")
+    prompt_messages_text = json.dumps(prompt_messages, ensure_ascii=False) if prompt_messages is not None else None
     label = payload.get("label") or _step_label(step_name)
     with db_session() as conn:
         cursor = conn.execute(
@@ -235,6 +243,7 @@ async def update_job_step(job_id: str, step_name: str, status: str, payload: dic
             SET status = ?,
                 attempts = ?,
                 error = ?,
+                prompt_messages = COALESCE(?, prompt_messages),
                 raw_response = COALESCE(?, raw_response),
                 parsed_payload = COALESCE(?, parsed_payload),
                 latency_ms = COALESCE(?, latency_ms),
@@ -247,6 +256,7 @@ async def update_job_step(job_id: str, step_name: str, status: str, payload: dic
                 status,
                 int(payload.get("attempts") or 0),
                 payload.get("error") or "",
+                prompt_messages_text,
                 payload.get("raw_response"),
                 parsed_text,
                 payload.get("latency_ms"),
@@ -261,8 +271,8 @@ async def update_job_step(job_id: str, step_name: str, status: str, payload: dic
             conn.execute(
                 """
                 INSERT INTO generation_job_steps
-                    (id, job_id, step_name, label, status, attempts, error, raw_response, parsed_payload, latency_ms, started_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, job_id, step_name, label, status, attempts, error, prompt_messages, raw_response, parsed_payload, latency_ms, started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _step_id(),
@@ -272,6 +282,7 @@ async def update_job_step(job_id: str, step_name: str, status: str, payload: dic
                     status,
                     int(payload.get("attempts") or 0),
                     payload.get("error") or "",
+                    prompt_messages_text or "[]",
                     payload.get("raw_response") or "",
                     parsed_text or "",
                     payload.get("latency_ms"),

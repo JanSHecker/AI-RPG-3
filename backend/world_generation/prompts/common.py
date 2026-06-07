@@ -1,7 +1,7 @@
 import json
 from typing import Any, Optional
 
-from world_generation.schemas import FACTION_COUNT, NPC_COUNT, PLACE_COUNT, RELATIONSHIP_COUNT
+from world_generation.schemas import FACTION_COUNT, NPC_COUNT, PERSONALITIES, PLACE_COUNT, RELATIONSHIP_TARGET_COUNT, SECONDARY_RELATIONSHIP_TYPES
 
 def render_json_block(value: Any) -> str:
     return json.dumps(value, indent=2)
@@ -22,7 +22,7 @@ def generation_shape() -> dict[str, int]:
         "places": PLACE_COUNT,
         "factions": FACTION_COUNT,
         "npcs": NPC_COUNT,
-        "relationships": RELATIONSHIP_COUNT,
+        "relationships": RELATIONSHIP_TARGET_COUNT,
     }
 
 
@@ -77,7 +77,7 @@ def faction_shape() -> dict[str, Any]:
                 "source_name": "string",
                 "target_kind": "character",
                 "target_name": "string",
-                "relation_type": "string",
+                "relation_type": SECONDARY_RELATIONSHIP_TYPES[0],
                 "description": "string",
             }
         ],
@@ -90,7 +90,7 @@ def npc_shape() -> dict[str, Any]:
         "ref": "npc-001-kebab-case",
         "name": "string",
         "age": 30,
-        "personality": "wary but generous",
+        "personality": PERSONALITIES[:3],
         "job": "warden",
         "faction_ref": "faction-kebab-case",
         "home_place_ref": "place-kebab-case",
@@ -107,6 +107,6 @@ def relationship_shape() -> dict[str, Any]:
         "source_ref": "faction-kebab-case",
         "target_type": "place",
         "target_ref": "place-kebab-case",
-        "relation_type": "alliance",
+        "relation_type": SECONDARY_RELATIONSHIP_TYPES[0],
         "description": "string",
     }

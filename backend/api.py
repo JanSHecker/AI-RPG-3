@@ -7,6 +7,15 @@ from pydantic import BaseModel
 from database import init_db
 from model_catalog import ConfiguredModel, find_model, load_model_catalog, resolve_active_model, save_active_model_id
 from providers import ProviderError, chat_completion
+from play_repository import (
+    append_play_message,
+    get_faction,
+    get_npc_for_play,
+    get_play_state,
+    list_npc_relationships,
+    lore_excerpt,
+    travel_play_session,
+)
 from world_repository import (
     delete_world,
     get_world,
@@ -54,6 +63,78 @@ class CreateWorldRequest(BaseModel):
 
 class RestartGenerationJobRequest(BaseModel):
     model_id: Optional[str] = None
+
+
+class PlayTravelRequest(BaseModel):
+    place_id: str
+
+
+class PlayTalkRequest(BaseModel):
+    npc_id: str
+    message: str
+
+
+def build_npc_dialogue_messages(world_id: str, npc_id: str, player_message: str) -> list[dict[str, str]]:
+    state = get_play_state(world_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="World not found.")
+    npc = get_npc_for_play(world_id, npc_id)
+    if not npc:
+        raise HTTPException(status_code=404, detail="NPC not found in this world.")
+
+    world = state["world"]
+    place = state["current_place"] or {}
+    character = state["character"]
+    faction = get_faction(world_id, npc.get("faction_id"))
+    relationships = list_npc_relationships(world_id, npc_id)
+    personality = ", ".join(npc.get("personality") or [])
+    relationship_lines = "\n".join(
+        f"- {item['relation_type']}: {item['description']}"
+        for item in relationships[:8]
+    ) or "- No known relationship context."
+    recent_lines = "\n".join(
+        f"{item['kind']}: {item['content']}"
+        for item in state["messages"][-12:]
+    ) or "No prior play messages."
+
+    system = f"""
+You are roleplaying an NPC in a local text RPG. Stay in character and answer as the NPC only.
+Keep the response concise, specific to the scene, and actionable for the player. Do not return JSON.
+
+World: {world.get('title', 'Unknown world')}
+Region: {world.get('region', {}).get('name', '')}
+Region summary: {world.get('region', {}).get('summary', '')}
+
+Player character: {character['name']} - {character['summary']}
+
+Current place: {place.get('name', 'Unknown place')}
+Place type: {place.get('place_type', '')}
+Terrain: {place.get('terrain', '')}
+Danger level: {place.get('danger_level', '')}
+Place summary: {place.get('summary', '')}
+Place lore excerpt:
+{lore_excerpt(world_id, 'places', place.get('id', ''))}
+
+NPC: {npc.get('name', '')}
+Age: {npc.get('age', '')}
+Job: {npc.get('job', '')}
+Personality: {personality}
+Status: {npc.get('status', '')}
+Faction: {faction.get('name', 'None') if faction else 'None'}
+NPC lore excerpt:
+{lore_excerpt(world_id, 'npcs', npc_id)}
+
+Relevant relationships:
+{relationship_lines}
+
+Recent play log:
+{recent_lines}
+""".strip()
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": player_message},
+    ]
 
 
 @router.get("/models")
@@ -193,6 +274,54 @@ async def api_get_world(world_id: str):
     if not world:
         raise HTTPException(status_code=404, detail="World not found.")
     return {"world": world}
+
+
+@router.get("/worlds/{world_id}/play")
+async def api_get_play_state(world_id: str):
+    try:
+        state = get_play_state(world_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not state:
+        raise HTTPException(status_code=404, detail="World not found.")
+    return state
+
+
+@router.post("/worlds/{world_id}/play/travel")
+async def api_play_travel(world_id: str, request: PlayTravelRequest):
+    try:
+        return travel_play_session(world_id, request.place_id)
+    except ValueError as exc:
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc))
+
+
+@router.post("/worlds/{world_id}/play/talk")
+async def api_play_talk(world_id: str, request: PlayTalkRequest):
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+    if not get_npc_for_play(world_id, request.npc_id):
+        raise HTTPException(status_code=404, detail="NPC not found in this world.")
+
+    append_play_message(world_id, "player", message, request.npc_id)
+    try:
+        model = resolve_active_model()
+        reply, _latency_ms = await chat_completion(
+            model,
+            build_npc_dialogue_messages(world_id, request.npc_id, message),
+            temperature=0.8,
+        )
+        append_play_message(world_id, "npc", reply, request.npc_id)
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=f"NPC response failed: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"NPC response failed: {exc}")
+
+    state = get_play_state(world_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="World not found.")
+    return state
 
 
 @router.delete("/worlds/{world_id}", status_code=204)

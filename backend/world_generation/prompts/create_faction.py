@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from providers import ProviderError
 from world_generation.agent_framework_compat import step
 from world_generation.prompts.common import faction_shape, feedback_block, generation_shape, render_json_block
-from world_generation.schemas import FACTION_COUNT, FactionDraft, RegionDraft
+from world_generation.schemas import FACTION_COUNT, PRIMARY_RELATIONSHIP_TYPES, SECONDARY_RELATIONSHIP_TYPES, FactionDraft, RegionDraft
 from world_generation.step_runtime import run_structured_step
 
 
@@ -30,6 +30,12 @@ Target count:
 Required JSON shape:
 {render_json_block({"factions": [faction_shape()]})}
 
+Primary requirement relationship types:
+{render_json_block(PRIMARY_RELATIONSHIP_TYPES)}
+
+Secondary requirement relationship types:
+{render_json_block(SECONDARY_RELATIONSHIP_TYPES)}
+
 Constraints:
 - Return exactly the requested number of factions.
 - Each faction ref must be unique and use the format faction-kebab-case.
@@ -40,6 +46,8 @@ Constraints:
 - requirement_relationships describe named links between required_places and required_characters only.
 - requirement_relationships source_kind and target_kind must be place or character.
 - requirement_relationships source_name and target_name must exactly match names from that faction's required lists.
+- requirement_relationships relation_type must be exactly one of the listed primary or secondary requirement relationship types.
+- Prefer secondary relationship types for faction planning unless the faction explicitly requires family, marriage, romance, guardianship, or close kin.
 - Write useful prose lore in Markdown.
 """
     if retry_feedback:

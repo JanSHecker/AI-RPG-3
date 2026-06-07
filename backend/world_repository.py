@@ -55,6 +55,13 @@ def list_table(world_id: str, table: str) -> list[dict[str, Any]]:
                 item["tags"] = json.loads(item.pop("tags_json", "[]"))
                 item["stackable"] = bool(item["stackable"])
                 item["consumable"] = bool(item["consumable"])
+        if table == "npcs":
+            for item in items:
+                try:
+                    parsed = json.loads(item["personality"])
+                except (TypeError, json.JSONDecodeError):
+                    parsed = item["personality"]
+                item["personality"] = parsed if isinstance(parsed, list) else [parsed]
         return items
 
 

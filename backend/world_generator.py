@@ -235,7 +235,7 @@ def insert_world(
                     world_id,
                     npc.name,
                     npc.age,
-                    npc.personality,
+                    json.dumps(npc.personality),
                     npc.job,
                     id_map["faction_ids"].get(npc.faction_ref),
                     id_map["place_ids"][npc.home_place_ref],

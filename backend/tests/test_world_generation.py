@@ -10,14 +10,16 @@ from database import db_session, init_db
 from item_catalog import load_staple_catalog, seed_npc_inventory
 from main import app
 from model_catalog import ConfiguredModel, find_model, load_model_catalog, resolve_active_model, save_active_model_id
-from world_generation_jobs import RUNNING_TASKS, restart_generation_job, update_job_step
+from world_generation_jobs import RUNNING_TASKS, get_generation_job, restart_generation_job, update_job_step
 from world_generation.schemas import (
     FACTION_COUNT,
     FACTION_LOCATION_COUNT,
     NPC_COUNT,
+    PERSONALITIES,
     PLACE_COUNT,
     PLACE_TYPES,
     RELATIONSHIP_COUNT,
+    RELATIONSHIP_TYPES,
     FactionDraft,
     NpcDraft,
     PlaceDraft,
@@ -26,11 +28,32 @@ from world_generation.schemas import (
     WorldDraft,
 )
 from world_generator import insert_world
-from world_repository import read_lore, safe_lore_path
+from world_repository import list_table, read_lore, safe_lore_path
 
 
 def sample_model() -> ConfiguredModel:
     return ConfiguredModel(id="lmstudio:local-model", label="LM Studio", provider="lmstudio", model_name="local-model")
+
+
+def sample_personalities(idx: int) -> list[str]:
+    return [PERSONALITIES[(idx + offset) % len(PERSONALITIES)] for offset in range(3)]
+
+
+def test_npc_personality_aliases_are_canonicalized():
+    npc = NpcDraft(
+        ref="npc-alias-test",
+        name="Alias Test",
+        age=30,
+        personality=["steady", "pragmatic", "sensitive"],
+        job="warden",
+        faction_ref=None,
+        home_place_ref="place-1",
+        current_place_ref="place-1",
+        status="active",
+        lore="Alias test lore.",
+    )
+
+    assert npc.personality == ["stable", "pragmatic", "empathetic"]
 
 
 def sample_world_draft() -> WorldDraft:
@@ -91,7 +114,7 @@ def sample_world_draft() -> WorldDraft:
             ref=f"npc-{idx + 1:03d}",
             name=f"NPC {idx + 1}",
             age=20 + (idx % 30),
-            personality="wary but generous",
+            personality=sample_personalities(idx),
             job="warden",
             faction_ref=factions[idx % FACTION_COUNT].ref if idx % 5 else None,
             home_place_ref=places[idx % PLACE_COUNT].ref,
@@ -108,7 +131,7 @@ def sample_world_draft() -> WorldDraft:
             source_ref=factions[idx].ref,
             target_type="faction",
             target_ref=factions[(idx + 1) % FACTION_COUNT].ref,
-            relation_type="rivalry",
+            relation_type=RELATIONSHIP_TYPES[RELATIONSHIP_TYPES.index("rivalry")],
             description=f"Faction {idx + 1} competes with faction {(idx + 1) % FACTION_COUNT + 1}.",
         )
         for idx in range(FACTION_COUNT)
@@ -120,7 +143,7 @@ def sample_world_draft() -> WorldDraft:
             source_ref=npcs[idx].ref,
             target_type="place",
             target_ref=npcs[idx].current_place_ref,
-            relation_type="local tie",
+            relation_type=RELATIONSHIP_TYPES[RELATIONSHIP_TYPES.index("local tie")],
             description=f"NPC {idx + 1} is closely tied to their current place.",
         )
         for idx in range(RELATIONSHIP_COUNT - FACTION_COUNT)
@@ -177,6 +200,61 @@ def test_schema_initializes_blank_database(tmp_path):
     assert count_rows(db_path, "worlds") == 0
 
 
+def test_schema_initializes_play_tables(tmp_path):
+    db_path = tmp_path / "world.sqlite3"
+    init_db(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+    finally:
+        conn.close()
+
+    assert "play_sessions" in tables
+    assert "play_messages" in tables
+
+
+def test_schema_adds_prompt_messages_to_existing_job_steps_table(tmp_path):
+    db_path = tmp_path / "world.sqlite3"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE generation_job_steps (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                step_name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                raw_response TEXT NOT NULL DEFAULT '',
+                parsed_payload TEXT NOT NULL DEFAULT '',
+                latency_ms INTEGER,
+                started_at TEXT,
+                finished_at TEXT,
+                UNIQUE(job_id, step_name)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    init_db(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(generation_job_steps)").fetchall()}
+    finally:
+        conn.close()
+
+    assert "prompt_messages" in columns
+
+
 def test_generation_job_step_update_inserts_dynamic_batch_steps(tmp_path, monkeypatch):
     db_path = tmp_path / "world.sqlite3"
     monkeypatch.setattr(settings, "database_path", str(db_path))
@@ -204,6 +282,31 @@ def test_generation_job_step_update_inserts_dynamic_batch_steps(tmp_path, monkey
     assert row["attempts"] == 1
 
 
+def test_generation_job_step_update_stores_prompt_messages(tmp_path, monkeypatch):
+    db_path = tmp_path / "world.sqlite3"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    init_db()
+    insert_generation_job("gen-prompts", "running")
+    messages = [
+        {"role": "system", "content": "Create valid JSON."},
+        {"role": "user", "content": "World prompt:\nA glass desert"},
+    ]
+
+    asyncio.run(
+        update_job_step(
+            "gen-prompts",
+            "region",
+            "running",
+            {"attempts": 1, "error": "", "prompt_messages": messages},
+        )
+    )
+
+    job = get_generation_job("gen-prompts")
+
+    assert job is not None
+    assert job["steps"][0]["prompt_messages"] == messages
+
+
 def test_restart_generation_job_resets_failed_job(tmp_path, monkeypatch):
     db_path = tmp_path / "world.sqlite3"
     monkeypatch.setattr(settings, "database_path", str(db_path))
@@ -214,7 +317,13 @@ def test_restart_generation_job_resets_failed_job(tmp_path, monkeypatch):
             "gen-failed",
             "region",
             "failed",
-            {"attempts": 2, "error": "Bad JSON", "raw_response": "{oops}", "parsed_payload": {"bad": True}},
+            {
+                "attempts": 2,
+                "error": "Bad JSON",
+                "prompt_messages": [{"role": "user", "content": "Bad prompt"}],
+                "raw_response": "{oops}",
+                "parsed_payload": {"bad": True},
+            },
         )
     )
     with db_session() as conn:
@@ -243,6 +352,7 @@ def test_restart_generation_job_resets_failed_job(tmp_path, monkeypatch):
     assert job["steps"][0]["status"] == "pending"
     assert job["steps"][0]["attempts"] == 0
     assert job["steps"][0]["error"] == ""
+    assert job["steps"][0]["prompt_messages"] == []
     assert job["steps"][0]["raw_response"] == ""
     assert job["steps"][0]["parsed_payload"] == ""
 
@@ -408,6 +518,7 @@ def test_create_world_returns_generation_job_and_completes_pipeline(tmp_path, mo
                 "factions": {"factions": [faction.model_dump() for faction in draft.factions]},
                 "location_plan": {"slots": []},
                 "villages_places": {"places": [place.model_dump() for place in draft.places]},
+                "character_diagram": {"slots": []},
                 "npcs": {"npcs": [npc.model_dump() for npc in draft.npcs]},
                 "relationships": {"relationships": [rel.model_dump() for rel in draft.relationships]},
             }
@@ -429,7 +540,7 @@ def test_create_world_returns_generation_job_and_completes_pipeline(tmp_path, mo
         assert response.status_code == 202
         job = response.json()["job"]
         assert job["status"] in {"pending", "running", "done"}
-        assert len(job["steps"]) == 6
+        assert len(job["steps"]) == 7
 
         completed = None
         for _ in range(20):
@@ -506,3 +617,90 @@ def test_item_api_endpoints(tmp_path, monkeypatch):
         lore_payload = client.get(f"/worlds/{world_id}/lore/{item['lore_entity_type']}/{item['id']}")
         assert lore_payload.status_code == 200
         assert lore_payload.json()["content"]
+
+
+def test_play_state_api_creates_session(tmp_path, monkeypatch):
+    db_path = tmp_path / "world.sqlite3"
+    worlds_path = tmp_path / "worlds"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    monkeypatch.setattr(settings, "worlds_dir", str(worlds_path))
+    RUNNING_TASKS.clear()
+    init_db()
+    world_id = insert_world("A road of low winter shrines", sample_model(), sample_world_draft(), "{}", 0)
+
+    with TestClient(app) as client:
+        response = client.get(f"/worlds/{world_id}/play")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["session"]["world_id"] == world_id
+    assert payload["character"]["name"] == "Kaelen Duskborn"
+    assert payload["current_place"]["id"] in {place["id"] for place in payload["places"]}
+    assert payload["messages"][0]["kind"] == "system"
+
+
+def test_play_travel_rejects_invalid_place_and_updates_location(tmp_path, monkeypatch):
+    db_path = tmp_path / "world.sqlite3"
+    worlds_path = tmp_path / "worlds"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    monkeypatch.setattr(settings, "worlds_dir", str(worlds_path))
+    RUNNING_TASKS.clear()
+    init_db()
+    first_world_id = insert_world("A copper hill road", sample_model(), sample_world_draft(), "{}", 0)
+    first_place = list_table(first_world_id, "places")[0]
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            f"/worlds/{first_world_id}/play/travel",
+            json={"place_id": "missing-place"},
+        )
+        accepted = client.post(
+            f"/worlds/{first_world_id}/play/travel",
+            json={"place_id": first_place["id"]},
+        )
+
+    assert rejected.status_code == 400
+    assert accepted.status_code == 200
+    payload = accepted.json()
+    assert payload["session"]["current_place_id"] == first_place["id"]
+    assert payload["messages"][-1]["kind"] == "travel"
+
+
+def test_play_talk_uses_llm_and_stores_messages(tmp_path, monkeypatch):
+    import api
+
+    db_path = tmp_path / "world.sqlite3"
+    worlds_path = tmp_path / "worlds"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    monkeypatch.setattr(settings, "worlds_dir", str(worlds_path))
+    RUNNING_TASKS.clear()
+    init_db()
+    world_id = insert_world("A market beneath black pines", sample_model(), sample_world_draft(), "{}", 0)
+    npc = list_table(world_id, "npcs")[0]
+    captured = {}
+
+    async def fake_chat_completion(model, messages, temperature=None, response_format=None):
+        captured["model"] = model
+        captured["messages"] = messages
+        captured["temperature"] = temperature
+        return "Keep your voice low; the road has been listening.", 9
+
+    monkeypatch.setattr(api, "chat_completion", fake_chat_completion)
+
+    with TestClient(app) as client:
+        missing = client.post(
+            f"/worlds/{world_id}/play/talk",
+            json={"npc_id": "missing-npc", "message": "Hello?"},
+        )
+        response = client.post(
+            f"/worlds/{world_id}/play/talk",
+            json={"npc_id": npc["id"], "message": "What should I know about this place?"},
+        )
+
+    assert missing.status_code == 404
+    assert response.status_code == 200
+    messages = response.json()["messages"]
+    assert messages[-2]["kind"] == "player"
+    assert messages[-1]["kind"] == "npc"
+    assert "What should I know" in captured["messages"][1]["content"]
+    assert npc["name"] in captured["messages"][0]["content"]

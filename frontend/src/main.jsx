@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import ReactMarkdown from "react-markdown";
 import { flexRender, getCoreRowModel, getSortedRowModel, useReactTable } from "@tanstack/react-table";
-import { ArrowLeft, Check, ChevronRight, ExternalLink, ListChecks, MapPin, Plus, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { Activity, ArrowLeft, Bed, BookOpen, Check, ChevronRight, Ellipsis, ExternalLink, Eye, Heart, ListChecks, MapPin, MessageSquare, PanelLeftClose, PanelLeftOpen, Play, Plus, RefreshCw, RotateCcw, Send, Shield, Sparkles, Trash2, X } from "lucide-react";
 import "./styles.css";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
@@ -154,14 +154,18 @@ function statusLabel(status) {
 }
 
 function routeFromPath() {
+  const playMatch = window.location.pathname.match(/^\/play\/([^/]+)$/);
+  if (playMatch) {
+    return { mode: "play", jobId: "", playWorldId: decodeURIComponent(playMatch[1]) };
+  }
   const jobDetailMatch = window.location.pathname.match(/^\/jobs\/([^/]+)$/);
   if (jobDetailMatch) {
-    return { mode: "job-detail", jobId: decodeURIComponent(jobDetailMatch[1]) };
+    return { mode: "job-detail", jobId: decodeURIComponent(jobDetailMatch[1]), playWorldId: "" };
   }
   if (window.location.pathname === "/jobs") {
-    return { mode: "jobs", jobId: "" };
+    return { mode: "jobs", jobId: "", playWorldId: "" };
   }
-  return { mode: "create", jobId: "" };
+  return { mode: "create", jobId: "", playWorldId: "" };
 }
 
 function generatorInstanceNote(step) {
@@ -222,7 +226,80 @@ function hasVisibleGeneratorProgress(step) {
   return Boolean(step.error || step.raw_response || step.parsed_payload || step.started_at || step.finished_at);
 }
 
-function GenerationJobs({ jobs, loading, error, onRefresh, onSelectJob, onOpenWorld, onRestartJob, onClearFinished, onClearActive }) {
+function formatStepPayload(value) {
+  if (!value) return "";
+  if (typeof value === "string") {
+    try {
+      return JSON.stringify(JSON.parse(value), null, 2);
+    } catch {
+      return value;
+    }
+  }
+  return JSON.stringify(value, null, 2);
+}
+
+function StepDetailDrawer({ instance, title, onClose }) {
+  useEffect(() => {
+    if (!instance) return undefined;
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [instance, onClose]);
+
+  if (!instance) return null;
+
+  const promptMessages = Array.isArray(instance.prompt_messages) ? instance.prompt_messages : [];
+  const responseText = instance.raw_response || formatStepPayload(instance.parsed_payload);
+  const meta = [
+    statusLabel(instance.status),
+    `Attempts ${instance.attempts ?? 0}`,
+    instance.latency_ms != null ? `${instance.latency_ms} ms` : "",
+  ].filter(Boolean).join(" Â· ");
+
+  return (
+    <div className="detail-drawer-layer" role="presentation">
+      <button className="detail-drawer-backdrop" type="button" onClick={onClose} aria-label="Close step detail" />
+      <aside className="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="step-detail-title">
+        <div className="detail-drawer-header">
+          <div className="detail-drawer-title-block">
+            <h2 id="step-detail-title">{title || instance.label || "Generator step"}</h2>
+            <div className="muted">{meta}</div>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} title="Close">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="detail-drawer-body">
+          <section className="detail-drawer-section">
+            <h3>Sent prompt</h3>
+            {promptMessages.length > 0 ? (
+              <div className="message-list">
+                {promptMessages.map((message, index) => (
+                  <article key={`${message.role ?? "message"}-${index}`} className="message-block">
+                    <div className="message-role">{message.role || `message ${index + 1}`}</div>
+                    <pre>{message.content || ""}</pre>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-panel">Sent prompt unavailable for this job.</div>
+            )}
+          </section>
+
+          <section className="detail-drawer-section">
+            <h3>Response</h3>
+            {responseText ? <pre className="response-block">{responseText}</pre> : <div className="empty-panel">No response recorded yet.</div>}
+          </section>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function GenerationJobs({ jobs, loading, error, onRefresh, onSelectJob, onOpenWorld, onPlayWorld, onRestartJob, onClearFinished, onClearActive }) {
   const activeCount = jobs.filter((job) => ["pending", "running", "retrying"].includes(job.status)).length;
   const finishedCount = jobs.filter((job) => ["done", "failed"].includes(job.status)).length;
 
@@ -282,10 +359,16 @@ function GenerationJobs({ jobs, loading, error, onRefresh, onSelectJob, onOpenWo
                         </button>
                       ) : null}
                       {canOpen ? (
-                        <button className="button secondary" onClick={() => onOpenWorld(job.world_id)}>
-                          <ExternalLink size={16} />
-                          Open
-                        </button>
+                        <>
+                          <button className="button secondary" onClick={() => onOpenWorld(job.world_id)}>
+                            <ExternalLink size={16} />
+                            Open
+                          </button>
+                          <button className="button secondary" onClick={() => onPlayWorld(job.world_id)}>
+                            <Play size={16} />
+                            Play
+                          </button>
+                        </>
                       ) : null}
                     </div>
                   ) : null}
@@ -299,9 +382,13 @@ function GenerationJobs({ jobs, loading, error, onRefresh, onSelectJob, onOpenWo
   );
 }
 
-function GenerationJobDetail({ job, loading, error, onBack, onRefresh, onOpenWorld, onRestartJob }) {
+function GenerationJobDetail({ job, loading, error, onBack, onRefresh, onOpenWorld, onPlayWorld, onRestartJob }) {
   const [collapsedGeneratorRows, setCollapsedGeneratorRows] = useState({});
+  const [selectedGeneratorId, setSelectedGeneratorId] = useState("");
   const generatorRows = groupGeneratorInstances(job?.steps ?? []);
+  const selectedGenerator = generatorRows
+    .flatMap((row) => row.instances.map((instance) => ({ instance, row })))
+    .find(({ instance }) => instance.instanceId === selectedGeneratorId);
   const canOpen = job?.status === "done" && job?.world_id;
   const canRestart = job?.status === "failed";
   const toggleGeneratorRow = (rowType) => {
@@ -326,10 +413,16 @@ function GenerationJobDetail({ job, loading, error, onBack, onRefresh, onOpenWor
               Back
             </button>
             {canOpen ? (
-              <button className="button secondary" onClick={() => onOpenWorld(job.world_id)}>
-                <ExternalLink size={16} />
-                Open
-              </button>
+              <>
+                <button className="button secondary" onClick={() => onOpenWorld(job.world_id)}>
+                  <ExternalLink size={16} />
+                  Open
+                </button>
+                <button className="button secondary" onClick={() => onPlayWorld(job.world_id)}>
+                  <Play size={16} />
+                  Play
+                </button>
+              </>
             ) : null}
             {canRestart ? (
               <button className="button secondary" onClick={() => onRestartJob(job.id)}>
@@ -374,7 +467,12 @@ function GenerationJobDetail({ job, loading, error, onBack, onRefresh, onOpenWor
                       {row.instances.map((instance) => {
                         const title = generatorCardTitle(instance, row);
                         return (
-                          <div key={instance.instanceId} className="generator-card">
+                          <button
+                            key={instance.instanceId}
+                            className="generator-card"
+                            type="button"
+                            onClick={() => setSelectedGeneratorId(instance.instanceId)}
+                          >
                             {title ? <div className="generator-card-title">{title}</div> : null}
                             <div className="generator-card-main">
                               <span className={`status-dot status-${instance.status}`} aria-hidden="true" />
@@ -383,7 +481,7 @@ function GenerationJobDetail({ job, loading, error, onBack, onRefresh, onOpenWor
                             <div>Attempts {instance.attempts}</div>
                             <div>{generatorInstanceNote(instance)}</div>
                             {instance.error ? <div className="generator-card-error">{instance.error}</div> : null}
-                          </div>
+                          </button>
                         );
                       })}
                     </div>
@@ -393,6 +491,11 @@ function GenerationJobDetail({ job, loading, error, onBack, onRefresh, onOpenWor
             })
           )}
         </section>
+        <StepDetailDrawer
+          instance={selectedGenerator?.instance ?? null}
+          title={selectedGenerator ? generatorCardTitle(selectedGenerator.instance, selectedGenerator.row) || selectedGenerator.row.label : ""}
+          onClose={() => setSelectedGeneratorId("")}
+        />
       </div>
     </main>
   );
@@ -524,7 +627,7 @@ function ItemCarriers({ item }) {
   );
 }
 
-function WorldDetail({ world, data, activeTab, setActiveTab, selectedEntity, setSelectedEntity, lore, loreLoading, onDelete }) {
+function WorldDetail({ world, data, activeTab, setActiveTab, selectedEntity, setSelectedEntity, lore, loreLoading, onPlay, onDelete }) {
   const tabs = ["overview", "places", "npcs", "factions", "items", "relationships", "lore"];
   const places = data.places ?? [];
   const npcs = data.npcs ?? [];
@@ -550,10 +653,16 @@ function WorldDetail({ world, data, activeTab, setActiveTab, selectedEntity, set
           <h1>{world.title}</h1>
           <div className="muted">{world.region?.name} · {world.provider}/{world.model_name}</div>
         </div>
-        <button className="button danger" onClick={onDelete}>
-          <Trash2 size={16} />
-          Delete
-        </button>
+        <div className="header-actions">
+          <button className="button secondary" onClick={onPlay}>
+            <Play size={16} />
+            Play
+          </button>
+          <button className="button danger" onClick={onDelete}>
+            <Trash2 size={16} />
+            Delete
+          </button>
+        </div>
       </div>
 
       <nav className="tabs">
@@ -631,7 +740,7 @@ function WorldDetail({ world, data, activeTab, setActiveTab, selectedEntity, set
                 { key: "location", label: "Location" },
                 { key: "age", label: "Age" },
                 { key: "job", label: "Job" },
-                { key: "personality", label: "Personality" },
+                { key: "personality", label: "Personality", render: (npc) => (Array.isArray(npc.personality) ? npc.personality.join(", ") : npc.personality) },
                 { key: "status", label: "Status" },
               ]}
             />
@@ -707,6 +816,172 @@ function WorldDetail({ world, data, activeTab, setActiveTab, selectedEntity, set
   );
 }
 
+function PlayView({
+  playState,
+  loading,
+  error,
+  travelLoading,
+  talkLoading,
+  sidebarHidden,
+  onToggleSidebar,
+  onBackToWorld,
+  onTravel,
+  onTalk,
+}) {
+  const [selectedNpcId, setSelectedNpcId] = useState("");
+  const [message, setMessage] = useState("");
+
+  const world = playState?.world;
+  const session = playState?.session;
+  const character = playState?.character;
+  const currentPlace = playState?.current_place;
+  const presentNpcs = playState?.present_npcs ?? [];
+  const messages = playState?.messages ?? [];
+  const npcById = useMemo(() => new Map(presentNpcs.map((npc) => [npc.id, npc])), [presentNpcs]);
+  const selectedNpc = npcById.get(selectedNpcId) || presentNpcs[0] || null;
+
+  useEffect(() => {
+    if (presentNpcs.length === 0) {
+      setSelectedNpcId("");
+      return;
+    }
+    if (!presentNpcs.some((npc) => npc.id === selectedNpcId)) {
+      setSelectedNpcId(presentNpcs[0].id);
+    }
+  }, [presentNpcs, selectedNpcId]);
+
+  const submitTalk = async () => {
+    const text = message.trim();
+    if (!text || !selectedNpc || talkLoading) return;
+    await onTalk(selectedNpc.id, text);
+    setMessage("");
+  };
+
+  return (
+    <main className="content play-content">
+      <div className="content-header play-header">
+        <div>
+          <h1>{world?.title ?? "Play"}</h1>
+          <div className="muted">
+            {loading ? "Loading play state..." : `${currentPlace?.name ?? "Unknown place"} · ${character?.name ?? "Kaelen Duskborn"}`}
+          </div>
+        </div>
+        <div className="header-actions">
+          <button className="icon-button" type="button" onClick={onToggleSidebar} title={sidebarHidden ? "Show sidebar" : "Hide sidebar"}>
+            {sidebarHidden ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+          </button>
+          {world?.id ? (
+            <button className="button secondary" type="button" onClick={() => onBackToWorld(world.id)}>
+              <ArrowLeft size={16} />
+              World
+            </button>
+          ) : null}
+        </div>
+      </div>
+
+      {error ? <div className="error-banner">{error}</div> : null}
+
+      {loading && !playState ? (
+        <section className="main-panel">
+          <div className="empty-panel">Loading play state.</div>
+        </section>
+      ) : (
+        <section className="play-layout">
+          <div className="play-main main-panel">
+            <div className="play-place-head">
+              <div>
+                <h2>{currentPlace?.name ?? "Unknown place"}</h2>
+                <div className="muted">
+                  {[currentPlace?.place_type, currentPlace?.terrain, currentPlace?.danger_level ? `Danger ${currentPlace.danger_level}` : ""].filter(Boolean).join(" · ")}
+                </div>
+              </div>
+              <button className="button secondary" type="button">
+                <BookOpen size={16} />
+                View Area
+              </button>
+            </div>
+            <p className="play-place-summary">{currentPlace?.summary ?? "This place has no summary yet."}</p>
+
+            <div className="play-log" aria-live="polite">
+              {messages.length === 0 ? (
+                <div className="empty-panel">No play messages yet.</div>
+              ) : (
+                messages.map((item) => {
+                  const npc = item.npc_id ? npcById.get(item.npc_id) : null;
+                  const title = item.kind === "player" ? character?.name : item.kind === "npc" ? npc?.name || "NPC" : item.kind;
+                  return (
+                    <article key={item.id} className={`play-message play-message-${item.kind}`}>
+                      <div className="play-message-meta">{title}</div>
+                      <div>{item.content}</div>
+                    </article>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="play-composer">
+              <div className="field-label">Talk to {selectedNpc?.name ?? "an NPC"}</div>
+              <div className="play-input-row">
+                <textarea
+                  value={message}
+                  onChange={(event) => setMessage(event.target.value)}
+                  placeholder={selectedNpc ? `Say something to ${selectedNpc.name}...` : "No NPCs are present here."}
+                  rows={3}
+                  disabled={!selectedNpc || talkLoading}
+                />
+                <button className="icon-button play-send" type="button" onClick={() => submitTalk().catch(() => {})} disabled={!selectedNpc || !message.trim() || talkLoading}>
+                  {talkLoading ? <RefreshCw size={16} /> : <Send size={16} />}
+                </button>
+              </div>
+              <div className="play-helper-text">The AI will interpret your input and respond to the outcome.</div>
+              <div className="play-quick-actions">
+                <button type="button"><Eye size={17} /> Look Around</button>
+                <button type="button"><Activity size={17} /> Check Status</button>
+                <button type="button"><Bed size={17} /> Rest</button>
+                <button type="button"><Ellipsis size={17} /> More Actions</button>
+              </div>
+            </div>
+          </div>
+
+          <aside className="play-side">
+            <section className="play-side-section quest-panel">
+              <h2><MessageSquare size={17} /> Quest Log</h2>
+              <div className="quest-empty" aria-label="No quests tracked yet" />
+            </section>
+
+            <section className="play-side-section character-sheet-panel">
+              <h2><Shield size={17} /> Character</h2>
+              <div className="character-sheet-head">
+                <div className="character-portrait">{(character?.name ?? "K").slice(0, 1)}</div>
+                <div>
+                  <h3>{character?.name ?? "Kaelen Duskborn"}</h3>
+                  <div className="character-class">Level 12 - Shadowforged Rogue</div>
+                </div>
+              </div>
+              <div className="character-bars">
+                <div className="character-stat health"><Heart size={15} /><span>Health</span><strong>736 / 736</strong></div>
+                <div className="stat-track health"><span /></div>
+                <div className="character-stat mana"><Sparkles size={15} /><span>Mana</span><strong>312 / 412</strong></div>
+                <div className="stat-track mana"><span /></div>
+                <div className="character-stat focus"><Eye size={15} /><span>Focus</span><strong>90 / 110</strong></div>
+                <div className="stat-track focus"><span /></div>
+              </div>
+              <div className="character-attributes">
+                <span>Strength <strong>14</strong></span>
+                <span>Intelligence <strong>13</strong></span>
+                <span>Dexterity <strong>19</strong></span>
+                <span>Wisdom <strong>12</strong></span>
+                <span>Constitution <strong>15</strong></span>
+                <span>Charisma <strong>10</strong></span>
+              </div>
+            </section>
+          </aside>
+        </section>
+      )}
+    </main>
+  );
+}
+
 function App() {
   const initialRoute = routeFromPath();
   const [worlds, setWorlds] = useState([]);
@@ -716,6 +991,12 @@ function App() {
   const [selectedJob, setSelectedJob] = useState(null);
   const [jobDetailLoading, setJobDetailLoading] = useState(false);
   const [selectedWorldId, setSelectedWorldId] = useState("");
+  const [playWorldId, setPlayWorldId] = useState(initialRoute.playWorldId);
+  const [playState, setPlayState] = useState(null);
+  const [playLoading, setPlayLoading] = useState(false);
+  const [travelLoading, setTravelLoading] = useState(false);
+  const [talkLoading, setTalkLoading] = useState(false);
+  const [sidebarHidden, setSidebarHidden] = useState(initialRoute.mode === "play");
   const [world, setWorld] = useState(null);
   const [data, setData] = useState({ places: [], npcs: [], factions: [], items: [], inventory: [], relationships: [] });
   const [models, setModels] = useState([]);
@@ -733,12 +1014,18 @@ function App() {
 
   const activeModel = useMemo(() => models.find((model) => model.id === activeModelId), [models, activeModelId]);
 
-  const navigateMode = (nextMode, path = "/", nextJobId = "") => {
+  const navigateMode = (nextMode, path = "/", nextJobId = "", nextPlayWorldId = "") => {
     if (window.location.pathname !== path) {
       window.history.pushState({}, "", path);
     }
     setMode(nextMode);
     setSelectedJobId(nextJobId);
+    setPlayWorldId(nextPlayWorldId);
+    if (nextMode === "play") {
+      setSidebarHidden(true);
+    } else {
+      setSidebarHidden(false);
+    }
   };
 
   const loadWorlds = async () => {
@@ -802,16 +1089,39 @@ function App() {
     setSelectedEntity({ type: "region", row: { id: "region" } });
   };
 
+  const loadPlayState = async (worldId) => {
+    if (!worldId) return null;
+    setPlayLoading(true);
+    try {
+      const payload = await request(`/worlds/${encodeURIComponent(worldId)}/play`);
+      setPlayState(payload);
+      setSelectedWorldId(worldId);
+      return payload;
+    } finally {
+      setPlayLoading(false);
+    }
+  };
+
+  const openPlay = async (worldId) => {
+    setError("");
+    navigateMode("play", `/play/${encodeURIComponent(worldId)}`, "", worldId);
+    await loadPlayState(worldId);
+  };
+
   useEffect(() => {
     loadModels().catch((loadError) => setError(loadError.message));
     loadGenerationJobs().catch((loadError) => setError(loadError.message));
     const startsOnJobsRoute = window.location.pathname === "/jobs" || window.location.pathname.startsWith("/jobs/");
+    const startsOnPlayRoute = initialRoute.mode === "play" && initialRoute.playWorldId;
     if (initialRoute.mode === "job-detail" && initialRoute.jobId) {
       loadGenerationJob(initialRoute.jobId).catch((loadError) => setError(loadError.message));
     }
+    if (startsOnPlayRoute) {
+      loadPlayState(initialRoute.playWorldId).catch((loadError) => setError(loadError.message));
+    }
     loadWorlds()
       .then((items) => {
-        if (items.length > 0 && !startsOnJobsRoute) {
+        if (items.length > 0 && !startsOnJobsRoute && !startsOnPlayRoute) {
           loadWorld(items[0].id).catch((loadError) => setError(loadError.message));
         }
       })
@@ -823,10 +1133,14 @@ function App() {
       const route = routeFromPath();
       setMode(route.mode);
       setSelectedJobId(route.jobId);
+      setPlayWorldId(route.playWorldId);
+      setSidebarHidden(route.mode === "play");
       if (window.location.pathname === "/jobs") {
         loadGenerationJobs().catch((loadError) => setError(loadError.message));
       } else if (route.mode === "job-detail" && route.jobId) {
         loadGenerationJob(route.jobId).catch((loadError) => setError(loadError.message));
+      } else if (route.mode === "play" && route.playWorldId) {
+        loadPlayState(route.playWorldId).catch((loadError) => setError(loadError.message));
       }
     };
     window.addEventListener("popstate", handlePopState);
@@ -999,29 +1313,76 @@ function App() {
     await loadGenerationJobs();
   };
 
+  const travelPlay = async (placeId) => {
+    if (!playWorldId) return;
+    setTravelLoading(true);
+    setError("");
+    try {
+      const payload = await request(`/worlds/${encodeURIComponent(playWorldId)}/play/travel`, {
+        method: "POST",
+        body: JSON.stringify({ place_id: placeId }),
+      });
+      setPlayState(payload);
+    } catch (travelError) {
+      setError(travelError.message);
+    } finally {
+      setTravelLoading(false);
+    }
+  };
+
+  const talkToNpc = async (npcId, text) => {
+    if (!playWorldId) return;
+    const optimisticMessage = {
+      id: `pending-${Date.now()}`,
+      session_id: playState?.session?.id ?? "",
+      kind: "player",
+      npc_id: npcId,
+      content: text,
+      created_at: new Date().toISOString(),
+    };
+    setPlayState((current) => current ? { ...current, messages: [...(current.messages ?? []), optimisticMessage] } : current);
+    setTalkLoading(true);
+    setError("");
+    try {
+      const payload = await request(`/worlds/${encodeURIComponent(playWorldId)}/play/talk`, {
+        method: "POST",
+        body: JSON.stringify({ npc_id: npcId, message: text }),
+      });
+      setPlayState(payload);
+    } catch (talkError) {
+      setError(talkError.message);
+      await loadPlayState(playWorldId).catch(() => {});
+      throw talkError;
+    } finally {
+      setTalkLoading(false);
+    }
+  };
+
   return (
-    <div className="app-shell">
-      <Sidebar
-        worlds={worlds}
-        selectedWorldId={selectedWorldId}
-        onSelectWorld={(id) => loadWorld(id).catch((loadError) => setError(loadError.message))}
-        onNewWorld={() => {
-          navigateMode("create");
-          setError("");
-        }}
-        onShowJobs={() => {
-          navigateMode("jobs", "/jobs");
-          setError("");
-          loadGenerationJobs().catch((loadError) => setError(loadError.message));
-        }}
-        onRefresh={() => loadWorlds().catch((loadError) => setError(loadError.message))}
-        models={models}
-        activeModelId={activeModelId}
-        onSelectModel={selectModel}
-        onTestModel={testModel}
-        modelStatus={modelStatus}
-        modelTestResult={modelTestResult}
-      />
+    <div className={`app-shell ${sidebarHidden ? "sidebar-hidden" : ""}`}>
+      {!sidebarHidden ? (
+        <Sidebar
+          worlds={worlds}
+          selectedWorldId={selectedWorldId}
+          onSelectWorld={(id) => loadWorld(id).catch((loadError) => setError(loadError.message))}
+          onNewWorld={() => {
+            navigateMode("create");
+            setError("");
+          }}
+          onShowJobs={() => {
+            navigateMode("jobs", "/jobs");
+            setError("");
+            loadGenerationJobs().catch((loadError) => setError(loadError.message));
+          }}
+          onRefresh={() => loadWorlds().catch((loadError) => setError(loadError.message))}
+          models={models}
+          activeModelId={activeModelId}
+          onSelectModel={selectModel}
+          onTestModel={testModel}
+          modelStatus={modelStatus}
+          modelTestResult={modelTestResult}
+        />
+      ) : null}
 
       {mode === "jobs" ? (
         <GenerationJobs
@@ -1035,6 +1396,7 @@ function App() {
             loadGenerationJob(jobId).catch((loadError) => setError(loadError.message));
           }}
           onOpenWorld={(worldId) => loadWorld(worldId).catch((loadError) => setError(loadError.message))}
+          onPlayWorld={(worldId) => openPlay(worldId).catch((loadError) => setError(loadError.message))}
           onRestartJob={(jobId) => restartGenerationJob(jobId).catch((restartError) => setError(restartError.message))}
           onClearFinished={() => clearFinishedJobs().catch((clearError) => setError(clearError.message))}
           onClearActive={() => clearActiveJobs().catch((clearError) => setError(clearError.message))}
@@ -1051,7 +1413,21 @@ function App() {
           }}
           onRefresh={() => loadGenerationJob(selectedJobId).catch((loadError) => setError(loadError.message))}
           onOpenWorld={(worldId) => loadWorld(worldId).catch((loadError) => setError(loadError.message))}
+          onPlayWorld={(worldId) => openPlay(worldId).catch((loadError) => setError(loadError.message))}
           onRestartJob={(jobId) => restartGenerationJob(jobId).catch((restartError) => setError(restartError.message))}
+        />
+      ) : mode === "play" ? (
+        <PlayView
+          playState={playState}
+          loading={playLoading}
+          error={error}
+          travelLoading={travelLoading}
+          talkLoading={talkLoading}
+          sidebarHidden={sidebarHidden}
+          onToggleSidebar={() => setSidebarHidden((current) => !current)}
+          onBackToWorld={(worldId) => loadWorld(worldId).catch((loadError) => setError(loadError.message))}
+          onTravel={(placeId) => travelPlay(placeId)}
+          onTalk={(npcId, text) => talkToNpc(npcId, text)}
         />
       ) : mode === "detail" && world ? (
         <WorldDetail
@@ -1063,6 +1439,7 @@ function App() {
           setSelectedEntity={setSelectedEntity}
           lore={lore}
           loreLoading={loreLoading}
+          onPlay={() => openPlay(world.id).catch((loadError) => setError(loadError.message))}
           onDelete={() => deleteSelectedWorld().catch((deleteError) => setError(deleteError.message))}
         />
       ) : (
@@ -1073,3 +1450,4 @@ function App() {
 }
 
 createRoot(document.getElementById("root")).render(<App />);
+

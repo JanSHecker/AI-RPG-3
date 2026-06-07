@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     worlds_dir: str = "../worlds"
     staple_items_path: str = "data/items/staple_items.json"
     staple_item_lore_dir: str = "data/items/lore"
+    personalities_path: str = "data/personalities.json"
+    primary_relationship_types_path: str = "data/primary_relationship_types.json"
+    secondary_relationship_types_path: str = "data/secondary_relationship_types.json"
     model_name: str = "lmstudio:local-model"
     temperature: float = 0.7
 
@@ -43,6 +46,18 @@ class Settings(BaseSettings):
     @property
     def staple_item_lore_path(self) -> Path:
         return (BASE_DIR / self.staple_item_lore_dir).resolve()
+
+    @property
+    def personalities_file(self) -> Path:
+        return (BASE_DIR / self.personalities_path).resolve()
+
+    @property
+    def primary_relationship_types_file(self) -> Path:
+        return (BASE_DIR / self.primary_relationship_types_path).resolve()
+
+    @property
+    def secondary_relationship_types_file(self) -> Path:
+        return (BASE_DIR / self.secondary_relationship_types_path).resolve()
 
 
 settings = Settings()

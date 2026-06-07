@@ -90,11 +90,16 @@ JOB_ITEM_PREFERENCES = {
 
 
 PERSONALITY_ITEM_PREFERENCES = {
-    "wary but generous": ["staple-bandage-roll", "staple-ration-pack"],
-    "dry-humored and stubborn": ["staple-work-axe", "staple-flint-kit"],
-    "ambitious and polished": ["staple-silver-trade-bars", "staple-leather-jerkin"],
-    "quietly fearful": ["staple-torch-bundle", "staple-waterskin"],
-    "curious and restless": ["staple-lockpick-roll", "staple-hemp-rope"],
+    "cautious": ["staple-bandage-roll", "staple-ration-pack"],
+    "stubborn": ["staple-work-axe", "staple-flint-kit"],
+    "ambitious": ["staple-silver-trade-bars", "staple-leather-jerkin"],
+    "fearful": ["staple-torch-bundle", "staple-waterskin"],
+    "curious": ["staple-lockpick-roll", "staple-hemp-rope"],
+    "generous": ["staple-bandage-roll", "staple-ration-pack"],
+    "disciplined": ["staple-leather-jerkin", "staple-flint-kit"],
+    "practical": ["staple-hemp-rope", "staple-flint-kit"],
+    "secretive": ["staple-lockpick-roll", "staple-torch-bundle"],
+    "bold": ["staple-hunting-knife", "staple-work-axe"],
 }
 
 
@@ -108,6 +113,13 @@ def _dedupe_preserve_order(values: list[str]) -> list[str]:
     return ordered
 
 
+def _personality_values(npc: BaseModel) -> list[str]:
+    personality = getattr(npc, "personality", [])
+    if isinstance(personality, str):
+        return [personality]
+    return [value for value in personality if isinstance(value, str)]
+
+
 def seed_npc_inventory(world_id: str, npcs: list[BaseModel], seed: int, staple_map: Optional[dict[str, StapleItemDefinition]] = None) -> list[NpcInventoryItem]:
     catalog = staple_map or load_staple_catalog_map()
     catalog_ids = set(catalog)
@@ -119,7 +131,11 @@ def seed_npc_inventory(world_id: str, npcs: list[BaseModel], seed: int, staple_m
             "staple-ration-pack",
             "staple-waterskin",
             *JOB_ITEM_PREFERENCES.get(getattr(npc, "job", ""), []),
-            *PERSONALITY_ITEM_PREFERENCES.get(getattr(npc, "personality", ""), []),
+            *[
+                item_id
+                for personality in _personality_values(npc)
+                for item_id in PERSONALITY_ITEM_PREFERENCES.get(personality, [])
+            ],
         ]
         desired_ids = [item_id for item_id in _dedupe_preserve_order(desired_ids) if item_id in catalog_ids]
         desired_count = 1 + npc_rng.randint(0, 2)
