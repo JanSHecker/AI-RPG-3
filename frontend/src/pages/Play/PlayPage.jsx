@@ -13,7 +13,7 @@ import {
   muted,
   panel,
 } from "../../shared/ui/classes.js";
-import { usePlayPage } from "./hooks/usePlayPage.js";
+import { usePlayStateQuery, usePlayInputMutation } from "./hooks/usePlayQuery.js";
 import CommandComposer from "./components/CommandComposer.jsx";
 import PlayLog from "./components/PlayLog.jsx";
 import PlaySidePanels from "./components/PlaySidePanels.jsx";
@@ -26,7 +26,9 @@ export default function PlayPage({
   onToggleSidebar,
   onBackToWorld,
 }) {
-  const { playState, loading, inputLoading, submitPlayInput } = usePlayPage({ worldId, setError });
+  const { data: playState, isLoading: loading } = usePlayStateQuery({ worldId, enabled: !!worldId });
+  const inputMut = usePlayInputMutation({ worldId });
+  const inputLoading = inputMut.isPending;
 
   const world = playState?.world;
   const session = playState?.session;
@@ -100,7 +102,12 @@ export default function PlayPage({
               places={places}
               presentNpcs={presentNpcs}
               inputLoading={inputLoading}
-              onSubmit={submitPlayInput}
+              onSubmit={(input) => {
+                setError("");
+                inputMut.mutate(input, {
+                  onError: (inputError) => setError(inputError.message),
+                });
+              }}
             />
           </div>
 

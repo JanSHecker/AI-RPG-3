@@ -1,0 +1,16 @@
+export const queryKeys = {
+  worlds: ["worlds"],
+  world: (id) => ["worlds", id],
+  worldPlaces: (id) => ["worlds", id, "places"],
+  worldNpcs: (id) => ["worlds", id, "npcs"],
+  worldFactions: (id) => ["worlds", id, "factions"],
+  worldItems: (id) => ["worlds", id, "items"],
+  worldInventory: (id) => ["worlds", id, "npc-inventory"],
+  worldRelationships: (id) => ["worlds", id, "relationships"],
+  worldLore: (worldId, entityType, entityId) => ["worlds", worldId, "lore", entityType, entityId],
+  models: ["models"],
+  activeModel: ["models", "active"],
+  generationJobs: ["generation-jobs"],
+  generationJob: (id) => ["generation-jobs", id],
+  playState: (worldId) => ["worlds", worldId, "play"],
+};

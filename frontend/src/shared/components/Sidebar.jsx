@@ -1,7 +1,8 @@
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { Check, ListChecks, Plus, RefreshCw } from "lucide-react";
 import { cx } from "../lib/classNames.js";
 import { formatDate } from "../lib/format.js";
+import { useTestModelMutation } from "../../app/hooks/useModelsQuery.js";
 import {
   button,
   buttonPrimary,
@@ -35,10 +36,45 @@ export default function Sidebar({
   models,
   activeModelId,
   onSelectModel,
-  onTestModel,
-  modelStatus,
-  modelTestResult,
 }) {
+  const [modelStatus, setModelStatus] = useState("idle");
+  const [modelTestResult, setModelTestResult] = useState(null);
+  const testMutation = useTestModelMutation();
+
+  useEffect(() => {
+    setModelStatus("idle");
+    setModelTestResult(null);
+  }, [activeModelId]);
+
+  const activeModel = models.find((model) => model.id === activeModelId);
+  const isTesting = testMutation.isPending;
+
+  const handleTestModel = () => {
+    if (!activeModel || isTesting) return;
+    setModelStatus("testing");
+    setModelTestResult(null);
+    testMutation.mutate(activeModel, {
+      onSuccess: (payload) => {
+        const result = payload.results?.[0];
+        if (!result) {
+          setModelStatus("failed");
+          setModelTestResult({ error: "Model test returned no result." });
+          return;
+        }
+        setModelStatus(result.ok ? "ok" : "failed");
+        setModelTestResult({
+          latency_ms: result.latency_ms,
+          response_preview: result.response_preview,
+          error: result.error || (result.ok ? "" : "Model test failed."),
+        });
+      },
+      onError: (testError) => {
+        setModelStatus("failed");
+        setModelTestResult({ error: testError.message });
+      },
+    });
+  };
+
   const modelStatusText = {
     idle: "Waiting to test selected model.",
     testing: "Waiting for the model response...",
@@ -77,9 +113,9 @@ export default function Sidebar({
             </option>
           ))}
         </select>
-        <button className={cx(button, buttonSecondary, "w-full")} onClick={onTestModel} disabled={!activeModelId || modelStatus === "testing"}>
-          {modelStatus === "testing" ? <RefreshCw size={16} /> : <Check size={16} />}
-          {modelStatus === "testing" ? "Testing" : "Test model"}
+        <button className={cx(button, buttonSecondary, "w-full")} onClick={handleTestModel} disabled={!activeModelId || isTesting}>
+          {isTesting ? <RefreshCw size={16} /> : <Check size={16} />}
+          {isTesting ? "Testing" : "Test model"}
         </button>
         <div className="min-h-[52px] rounded-[7px] border border-[#2e2e2c] bg-[#151514] px-2.5 py-[9px] text-xs leading-[1.45] text-[#aaa49a]" aria-live="polite">
           <div className={modelStatusClass(modelStatus)}>{modelStatusText}</div>

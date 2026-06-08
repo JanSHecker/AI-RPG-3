@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import Sidebar from "../shared/components/Sidebar.jsx";
 import {
   PATH_HOME,
@@ -13,8 +14,9 @@ import {
   playPath,
   routeFromPath,
 } from "./routing.js";
-import { useModels } from "./hooks/useModels.js";
-import { useWorlds } from "./hooks/useWorlds.js";
+import { useModelsCatalog, useActiveModel, useSelectModelMutation } from "./hooks/useModelsQuery.js";
+import { useWorldsQuery } from "./hooks/useWorldsQuery.js";
+import { queryKeys } from "../api/queryKeys.js";
 import CreateWorldPage from "../pages/CreateWorld/CreateWorldPage.jsx";
 import GenerationJobsPage from "../pages/GenerationJobs/GenerationJobsPage.jsx";
 import GenerationJobDetailPage from "../pages/GenerationJobDetail/GenerationJobDetailPage.jsx";
@@ -32,16 +34,20 @@ export default function App() {
   const [sidebarHidden, setSidebarHidden] = useState(initialRoute.mode === ROUTE_PLAY);
   const [error, setError] = useState("");
 
-  const { worlds, loadWorlds } = useWorlds({ setError });
-  const {
-    models,
-    activeModelId,
-    modelStatus,
-    modelTestResult,
-    loadModels,
-    selectModel,
-    testModel,
-  } = useModels({ setError });
+  const queryClient = useQueryClient();
+  const { data: worlds = [] } = useWorldsQuery();
+  const { data: models = [] } = useModelsCatalog();
+  const { data: activeModel } = useActiveModel();
+  const selectModelMut = useSelectModelMutation();
+  const activeModelId = activeModel?.id ?? models[0]?.id ?? "";
+  const selectModel = useCallback(
+    (modelId) => {
+      selectModelMut.mutate(modelId, {
+        onError: (selectError) => setError(selectError.message),
+      });
+    },
+    [selectModelMut, setError],
+  );
 
   const navigateMode = useCallback((nextMode, { path = PATH_HOME, jobId = "", worldId = "" } = {}) => {
     if (window.location.pathname !== path) {
@@ -79,18 +85,13 @@ export default function App() {
   }, [navigateMode]);
 
   useEffect(() => {
-    loadModels().catch((loadError) => setError(loadError.message));
     const startsOnJobsLike = isJobsLikePath(window.location.pathname);
     const startsOnPlayRoute = initialRoute.mode === ROUTE_PLAY && initialRoute.playWorldId;
-    loadWorlds()
-      .then((items) => {
-        if (items.length > 0 && !startsOnJobsLike && !startsOnPlayRoute) {
-          setCurrentWorldId(items[0].id);
-          setMode(ROUTE_DETAIL);
-        }
-      })
-      .catch(() => {});
-  }, [loadModels, loadWorlds, initialRoute.mode, initialRoute.playWorldId]);
+    if (worlds.length > 0 && !startsOnJobsLike && !startsOnPlayRoute && !currentWorldId && mode === ROUTE_CREATE) {
+      setCurrentWorldId(worlds[0].id);
+      setMode(ROUTE_DETAIL);
+    }
+  }, [worlds, currentWorldId, mode, initialRoute.mode, initialRoute.playWorldId]);
 
   useEffect(() => {
     const handlePopState = () => {
@@ -108,16 +109,13 @@ export default function App() {
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
 
-  const handleAfterCreateWorld = useCallback(async () => {
-    try {
-      await loadWorlds();
-    } catch {
-      // already reported via setError in hook
-    }
-  }, [loadWorlds]);
+  const handleAfterCreateWorld = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.worlds });
+  }, [queryClient]);
 
   const handleAfterDeleteWorld = useCallback(async () => {
-    const next = await loadWorlds();
+    await queryClient.refetchQueries({ queryKey: queryKeys.worlds });
+    const next = queryClient.getQueryData(queryKeys.worlds) ?? [];
     if (next.length > 0) {
       setCurrentWorldId(next[0].id);
       navigateMode(ROUTE_DETAIL, { worldId: next[0].id });
@@ -125,11 +123,7 @@ export default function App() {
       setCurrentWorldId("");
       navigateMode(ROUTE_CREATE);
     }
-  }, [loadWorlds, navigateMode]);
-
-  const refreshWorlds = useCallback(() => {
-    loadWorlds().catch(() => {});
-  }, [loadWorlds]);
+  }, [queryClient, navigateMode]);
 
   const onBackToWorld = useCallback((worldId) => showWorld(worldId), [showWorld]);
   const onPlayCurrentWorld = useCallback(() => showPlay(currentWorldId), [showPlay, currentWorldId]);
@@ -146,13 +140,10 @@ export default function App() {
           onSelectWorld={showWorld}
           onNewWorld={showCreate}
           onShowJobs={showJobs}
-          onRefresh={refreshWorlds}
+          onRefresh={() => queryClient.invalidateQueries({ queryKey: queryKeys.worlds })}
           models={models}
           activeModelId={activeModelId}
           onSelectModel={selectModel}
-          onTestModel={testModel}
-          modelStatus={modelStatus}
-          modelTestResult={modelTestResult}
         />
       ) : null}
 
@@ -162,7 +153,6 @@ export default function App() {
           setError={setError}
           error={error}
           activeModelId={activeModelId}
-          onWorldsChanged={refreshWorlds}
           onSelectJob={showJobDetail}
           onOpenWorld={showWorld}
           onPlayWorld={showPlay}
@@ -174,7 +164,6 @@ export default function App() {
           setError={setError}
           error={error}
           activeModelId={activeModelId}
-          onWorldsChanged={refreshWorlds}
           onBack={showJobs}
           onOpenWorld={showWorld}
           onPlayWorld={showPlay}
@@ -194,7 +183,6 @@ export default function App() {
           setError={setError}
           onPlay={onPlayCurrentWorld}
           onAfterDelete={handleAfterDeleteWorld}
-          onWorldsChanged={refreshWorlds}
         />
       ) : (
         <CreateWorldPage

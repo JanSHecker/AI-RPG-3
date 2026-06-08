@@ -12,7 +12,11 @@ import {
   listPanel,
   muted,
 } from "../../shared/ui/classes.js";
-import { useGenerationJobDetailPage } from "./hooks/useGenerationJobDetailPage.js";
+import {
+  useGenerationJobQuery,
+  useRestartJobMutation,
+  useRetryStepMutation,
+} from "./hooks/useGenerationJobDetailQuery.js";
 import GeneratorRowCard from "./components/GeneratorRowCard.jsx";
 import StepDetailDrawer from "./components/StepDetailDrawer.jsx";
 import {
@@ -26,19 +30,13 @@ export default function GenerationJobDetailPage({
   setError,
   error,
   activeModelId,
-  onWorldsChanged,
   onBack,
   onOpenWorld,
   onPlayWorld,
 }) {
-  const {
-    job,
-    loading,
-    loadGenerationJob,
-    restartGenerationJob,
-    retryGenerationJobStep,
-  } = useGenerationJobDetailPage({ jobId, active, setError, onWorldsChanged, activeModelId });
-
+  const { data: job, isLoading, isError: isQueryError, error: queryError, refetch } = useGenerationJobQuery({ jobId, enabled: active });
+  const restartMut = useRestartJobMutation();
+  const retryStepMut = useRetryStepMutation();
   const [collapsedGeneratorRows, setCollapsedGeneratorRows] = useState({});
   const [selectedGeneratorId, setSelectedGeneratorId] = useState("");
   const generatorRows = groupGeneratorInstances(job?.steps ?? []);
@@ -51,6 +49,26 @@ export default function GenerationJobDetailPage({
     setCollapsedGeneratorRows((current) => ({ ...current, [rowType]: !current[rowType] }));
   };
 
+  const handleRestart = () => {
+    setError("");
+    restartMut.mutate(
+      { jobId, modelId: activeModelId },
+      { onError: (restartError) => setError(restartError.message) },
+    );
+  };
+
+  const handleRetryStep = (stepName) => {
+    setError("");
+    retryStepMut.mutate(
+      { jobId, stepName, modelId: activeModelId },
+      { onError: (retryError) => setError(retryError.message) },
+    );
+  };
+
+  const handleRefresh = () => {
+    refetch().catch((loadError) => setError(loadError.message));
+  };
+
   return (
     <main className="flex justify-center min-w-0 bg-[#111111] p-6">
       <div className="w-full max-w-[1040px]">
@@ -58,7 +76,7 @@ export default function GenerationJobDetailPage({
           <div className="min-w-0">
             <h1 className={h1}>Generation job</h1>
             <div className={muted}>
-              {job ? `${statusLabel(job.status)} - ${job.provider}/${job.model_name}` : loading ? "Loading..." : "No job loaded"}
+              {job ? `${statusLabel(job.status)} - ${job.provider}/${job.model_name}` : isLoading ? "Loading..." : "No job loaded"}
             </div>
             <div className="mt-1.5 truncate text-sm font-semibold text-[#eeeeec]">{job?.prompt ?? ""}</div>
             {job?.updated_at ? <div className={muted}>Updated {formatDate(job.updated_at)}</div> : null}
@@ -83,7 +101,7 @@ export default function GenerationJobDetailPage({
             {canRestart ? (
               <button
                 className={cx(button, buttonSecondary)}
-                onClick={() => restartGenerationJob().catch((restartError) => setError(restartError.message))}
+                onClick={handleRestart}
               >
                 <RotateCcw size={16} />
                 Restart
@@ -91,7 +109,7 @@ export default function GenerationJobDetailPage({
             ) : null}
             <button
               className={cx(button, buttonSecondary)}
-              onClick={() => loadGenerationJob().catch((loadError) => setError(loadError.message))}
+              onClick={handleRefresh}
             >
               <RefreshCw size={16} />
               Refresh
@@ -100,10 +118,11 @@ export default function GenerationJobDetailPage({
         </div>
 
         {error ? <div className={errorBanner}>{error}</div> : null}
+        {isQueryError && queryError ? <div className={errorBanner}>{queryError.message}</div> : null}
         {job?.error ? <div className={errorBanner}>{job.error}</div> : null}
 
         <section className={listPanel}>
-          {loading && !job ? (
+          {isLoading && !job ? (
             <div className={emptyPanel}>Loading generation job.</div>
           ) : generatorRows.length === 0 ? (
             <div className={emptyPanel}>No generator instances recorded.</div>
@@ -117,7 +136,7 @@ export default function GenerationJobDetailPage({
                 canRetrySteps={Boolean(activeModelId)}
                 onToggle={toggleGeneratorRow}
                 onSelectInstance={setSelectedGeneratorId}
-                onRetryStep={(stepName) => retryGenerationJobStep(stepName).catch((retryError) => setError(retryError.message))}
+                onRetryStep={handleRetryStep}
               />
             ))
           )}

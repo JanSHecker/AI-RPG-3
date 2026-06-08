@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Play, Trash2 } from "lucide-react";
 import { cx } from "../../shared/lib/classNames.js";
@@ -13,7 +13,17 @@ import {
   muted,
   panel,
 } from "../../shared/ui/classes.js";
-import { useWorldDetailPage } from "./hooks/useWorldDetailPage.js";
+import {
+  useWorldQuery,
+  useWorldPlacesQuery,
+  useWorldNpcsQuery,
+  useWorldFactionsQuery,
+  useWorldItemsQuery,
+  useWorldInventoryQuery,
+  useWorldRelationshipsQuery,
+  useWorldLoreQuery,
+  useDeleteWorldMutation,
+} from "./hooks/useWorldDetailQuery.js";
 import DataTable from "./components/DataTable.jsx";
 import ItemCarriers from "./components/ItemCarriers.jsx";
 import LorePanel from "./components/LorePanel.jsx";
@@ -27,33 +37,46 @@ const summaryGridClass = "grid grid-cols-1 gap-4 border-b border-[#2e2e2c] p-4 l
 const paragraphClass = "mt-2 leading-[1.55]";
 const loreFullClass = "rounded-lg border border-[#2e2e2c] bg-[#171716] p-[18px]";
 
+const INITIAL_TAB = "overview";
+const INITIAL_SELECTED_ENTITY = { type: "region", row: { id: "region" } };
+
 export default function WorldDetailPage({
   worldId,
   setError,
   onPlay,
   onAfterDelete,
-  onWorldsChanged,
 }) {
-  const {
-    world,
-    data,
-    activeTab,
-    setActiveTab,
-    selectedEntity,
-    setSelectedEntity,
-    lore,
-    loreLoading,
-    deleteSelectedWorld,
-  } = useWorldDetailPage({ worldId, setError, onAfterDelete, onWorldsChanged });
+  const enabled = !!worldId;
+  const { data: world, isLoading: worldLoading } = useWorldQuery(worldId, { enabled });
+  const { data: places = [] } = useWorldPlacesQuery(worldId, { enabled });
+  const { data: npcs = [] } = useWorldNpcsQuery(worldId, { enabled });
+  const { data: factions = [] } = useWorldFactionsQuery(worldId, { enabled });
+  const { data: items = [] } = useWorldItemsQuery(worldId, { enabled });
+  const { data: inventory = [] } = useWorldInventoryQuery(worldId, { enabled });
+  const { data: relationships = [] } = useWorldRelationshipsQuery(worldId, { enabled });
+  const deleteMut = useDeleteWorldMutation();
 
-  const places = data.places ?? [];
-  const npcs = data.npcs ?? [];
-  const factions = data.factions ?? [];
-  const items = data.items ?? [];
-  const relationships = data.relationships ?? [];
+  const [activeTab, setActiveTab] = useState(INITIAL_TAB);
+  const [selectedEntity, setSelectedEntity] = useState(INITIAL_SELECTED_ENTITY);
+
+  React.useEffect(() => {
+    setActiveTab(INITIAL_TAB);
+    setSelectedEntity(INITIAL_SELECTED_ENTITY);
+  }, [worldId]);
+
+  const loreEntityType = selectedEntity?.type ?? "region";
+  const loreEntityId = selectedEntity?.row?.id ?? "region";
+  const { data: lore = "", isLoading: loreLoading } = useWorldLoreQuery({
+    worldId,
+    entityType: loreEntityType,
+    entityId: loreEntityId,
+    enabled: enabled && !!selectedEntity?.type,
+  });
 
   const selectedPlace = selectedEntity?.type === "places" ? selectedEntity.row : places[0];
-  const selectedItem = selectedEntity?.type === "items" || selectedEntity?.type === "staple-items" ? selectedEntity.row : items[0];
+  const selectedItem = selectedEntity?.type === "items" || selectedEntity?.type === "staple-items"
+    ? selectedEntity.row
+    : items[0];
   const placeById = useMemo(() => new Map(places.map((place) => [place.id, place])), [places]);
   const npcsWithLocation = useMemo(
     () => npcs.map((npc) => {
@@ -62,6 +85,15 @@ export default function WorldDetailPage({
     }),
     [npcs, placeById],
   );
+
+  const handleDelete = () => {
+    if (!worldId) return;
+    if (!window.confirm(`Delete "${world?.title ?? worldId}"?`)) return;
+    deleteMut.mutate(worldId, {
+      onSuccess: () => onAfterDelete?.(),
+      onError: (deleteError) => setError(deleteError.message),
+    });
+  };
 
   if (!world) {
     return (
@@ -88,7 +120,7 @@ export default function WorldDetailPage({
           </button>
           <button
             className={cx(button, buttonDanger)}
-            onClick={() => deleteSelectedWorld().catch((deleteError) => setError(deleteError.message))}
+            onClick={handleDelete}
           >
             <Trash2 size={16} />
             Delete
