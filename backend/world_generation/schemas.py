@@ -1,6 +1,6 @@
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from personality_catalog import load_personality_catalog
 from relationship_catalog import load_primary_relationship_catalog, load_relationship_catalog, load_secondary_relationship_catalog
@@ -32,9 +32,84 @@ AGE_BANDS = ["child", "teen", "young adult", "adult", "elder"]
 CHARACTER_CLUSTER_KINDS = ["household", "family", "workplace", "faction cell", "social circle", "rivalry group"]
 
 
+REGION_IDENTITY_HEADINGS = [
+    ("overview", "Overview"),
+    ("geography", "Geography"),
+    ("climate", "Climate"),
+    ("peoples_and_culture", "Peoples and Culture"),
+    ("power_centers", "Power Centers"),
+    ("current_conflicts", "Current Conflicts"),
+    ("tone_and_themes", "Tone and Themes"),
+    ("generation_boundaries", "Generation Boundaries"),
+]
+
+
+class RegionIdentityDraft(BaseModel):
+    overview: str
+    geography: str
+    climate: str
+    peoples_and_culture: str
+    power_centers: str
+    current_conflicts: str
+    tone_and_themes: str
+    generation_boundaries: str
+
+
+def render_region_description(name: str, identity: RegionIdentityDraft) -> str:
+    sections = [f"# {name.strip() or 'Region'}"]
+    for field_name, heading in REGION_IDENTITY_HEADINGS:
+        sections.append(f"## {heading}\n\n{getattr(identity, field_name).strip()}")
+    return "\n\n".join(sections).strip() + "\n"
+
+
+def _summary_from_description(description: str) -> str:
+    compact = " ".join(description.split())
+    if not compact:
+        return "A region defined by the world prompt."
+    for delimiter in (". ", "! ", "? "):
+        if delimiter in compact:
+            sentence = compact.split(delimiter, 1)[0].strip() + delimiter.strip()
+            return sentence[:280].strip()
+    return compact[:280].strip()
+
+
+def _legacy_region_identity(description: str) -> dict[str, str]:
+    summary = _summary_from_description(description)
+    return {
+        "overview": summary,
+        "geography": "Use the original world prompt and later place generation to establish specific regional geography.",
+        "climate": "Use the original world prompt and later place generation to establish specific climate details.",
+        "peoples_and_culture": "Use the original world prompt and later NPC and faction generation to establish local peoples and culture.",
+        "power_centers": "Use later faction and place generation to establish high-level power centers.",
+        "current_conflicts": "Use later faction, place, NPC, and relationship generation to establish broad regional conflicts.",
+        "tone_and_themes": "Preserve the tone implied by the original region description.",
+        "generation_boundaries": "Do not treat this legacy primer as containing specific place records, NPC biographies, quest hooks, item details, resolved relationships, tactical encounters, or faction rosters.",
+    }
+
+
 class RegionDraft(BaseModel):
     name: str
-    description: str
+    summary: str
+    identity: RegionIdentityDraft
+    description: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_region(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        legacy_description = str(normalized.get("description") or "")
+        if "summary" not in normalized:
+            normalized["summary"] = _summary_from_description(legacy_description)
+        if "identity" not in normalized:
+            normalized["identity"] = _legacy_region_identity(legacy_description)
+        return normalized
+
+    @model_validator(mode="after")
+    def render_description(self) -> "RegionDraft":
+        self.description = render_region_description(self.name, self.identity)
+        return self
 
 
 class PlaceDraft(BaseModel):

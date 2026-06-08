@@ -19,7 +19,7 @@ def build_messages(prompt: str, previous_error: Optional[str] = None, previous_r
 {prompt}
 
 Task:
-Create the region identity for a text RPG world. Return JSON with title and region only.
+Create the structured region identity for a text RPG world. Return JSON with title and region only.
 
 Target counts for follow-up steps:
 {render_json_block(generation_shape())}
@@ -28,8 +28,11 @@ Required JSON shape:
 {render_json_block({"title": "string", "region": region_shape()})}
 
 Constraints:
-- Keep the region concise: just a name and a description.
-- Do not add quest hooks.
+- Return region.name, region.summary, and region.identity sections only; do not write Markdown and do not include region.description.
+- Keep each identity section concise but useful as shared context for later generation.
+- Region identity should contain region-wide truths: tone, geography, climate, major cultural assumptions, high-level powers, broad conflicts, and boundaries for later generators.
+- Region identity must not contain specific place records, NPC biographies, quest hooks, item details, resolved relationship records, tactical encounter details, or faction rosters.
+- Use generation_boundaries to state what belongs in later place, faction, NPC, item, relationship, and quest generation instead of the region primer.
 """
     if retry_feedback:
         prompt_body += f"\nRetry feedback:\n{retry_feedback}\n"

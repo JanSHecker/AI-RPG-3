@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional, TypeVar
 
@@ -12,7 +13,7 @@ from providers import ProviderError, chat_completion, parse_json_object, strict_
 
 StepUpdater = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 T = TypeVar("T", bound=BaseModel)
-MAX_STEP_ATTEMPTS = 2
+MAX_STEP_ATTEMPTS = 3
 
 STEP_LABELS = {
     "region": "Region",
@@ -103,6 +104,69 @@ def validation_text(exc: Exception) -> str:
     return str(exc)[:4000]
 
 
+def _format_loc(loc: tuple[Any, ...] | list[Any]) -> str:
+    parts: list[str] = []
+    for entry in loc:
+        if isinstance(entry, int):
+            if parts:
+                parts[-1] = f"{parts[-1]}[{entry}]"
+            else:
+                parts.append(f"[{entry}]")
+        else:
+            parts.append(str(entry))
+    return ".".join(parts)
+
+
+def _lookup_path(value: Any, loc: tuple[Any, ...] | list[Any]) -> Any:
+    current = value
+    for entry in loc:
+        if isinstance(current, dict) and isinstance(entry, str):
+            current = current.get(entry)
+        elif isinstance(current, list) and isinstance(entry, int) and 0 <= entry < len(current):
+            current = current[entry]
+        else:
+            return None
+    return current
+
+
+def _invalid_values_from_message(message: str) -> list[str]:
+    match = re.search(r"got (\[[^\]]+\])", message)
+    if not match:
+        return []
+    return re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
+
+
+def validation_feedback(exc: Exception, payload: Optional[dict[str, Any]] = None) -> str:
+    text = validation_text(exc)
+    if not isinstance(exc, ValidationError):
+        return text
+
+    summaries: list[str] = []
+    for error in exc.errors()[:5]:
+        loc = error.get("loc", ())
+        path = _format_loc(loc)
+        message = str(error.get("msg") or error.get("ctx", {}).get("error") or "")
+        parent = _lookup_path(payload, loc[:-1]) if payload and loc else None
+        ref = parent.get("ref") if isinstance(parent, dict) else None
+        input_value = error.get("input")
+
+        summary = f"- At {path}"
+        if ref:
+            summary += f" for ref '{ref}'"
+        summary += f": {message}"
+
+        invalid_values = _invalid_values_from_message(message)
+        if invalid_values:
+            summary += f" Replace {invalid_values} with exact allowed catalog value(s)."
+        elif input_value is not None:
+            summary += f" Submitted value was {json.dumps(input_value, ensure_ascii=False, default=str)}."
+        summaries.append(summary)
+
+    if not summaries:
+        return text
+    return f"{text}\n\nCorrection summary:\n" + "\n".join(summaries)
+
+
 def transcript_payloads(transcripts: list[StepTranscript]) -> list[dict[str, Any]]:
     return [transcript.to_payload() for transcript in transcripts]
 
@@ -133,6 +197,7 @@ async def run_structured_step(
         messages = build_messages(previous_error, previous_response)
         await update_step(updater, step_name, "running", attempts=attempt, error="", prompt_messages=messages)
         text = ""
+        payload: Optional[dict[str, Any]] = None
         try:
             text, latency_ms = await CHAT_ADAPTER.complete_json(
                 model=model,
@@ -168,7 +233,7 @@ async def run_structured_step(
             )
             return parsed, transcript
         except Exception as exc:
-            previous_error = validation_text(exc)
+            previous_error = validation_feedback(exc, payload)
             previous_response = text
             transcript.attempts.append(
                 AttemptRecord(

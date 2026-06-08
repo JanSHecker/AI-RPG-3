@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from database import db_session, init_db
 from item_catalog import load_staple_catalog, seed_npc_inventory
 from main import app
 from model_catalog import ConfiguredModel, find_model, load_model_catalog, resolve_active_model, save_active_model_id
-from world_generation_jobs import RUNNING_TASKS, get_generation_job, restart_generation_job, update_job_step
+from world_generation_jobs import RUNNING_TASKS, get_generation_job, restart_generation_job, retry_generation_job_step, update_job_step
 from world_generation.schemas import (
     FACTION_COUNT,
     FACTION_LOCATION_COUNT,
@@ -23,6 +24,7 @@ from world_generation.schemas import (
     FactionDraft,
     NpcDraft,
     PlaceDraft,
+    REGION_IDENTITY_HEADINGS,
     RegionDraft,
     RelationshipDraft,
     WorldDraft,
@@ -37,6 +39,23 @@ def sample_model() -> ConfiguredModel:
 
 def sample_personalities(idx: int) -> list[str]:
     return [PERSONALITIES[(idx + offset) % len(PERSONALITIES)] for offset in range(3)]
+
+
+def sample_region() -> RegionDraft:
+    return RegionDraft(
+        name="The Test Frontier",
+        summary="A generated test frontier.",
+        identity={
+            "overview": "A generated test frontier.",
+            "geography": "A broken road crosses hills, villages, and dangerous landmarks.",
+            "climate": "The region is marked by bitter rain and cold winds.",
+            "peoples_and_culture": "Settlers, wardens, traders, and old families share wary customs.",
+            "power_centers": "Councils and frontier factions compete over travel, stores, and protection.",
+            "current_conflicts": "Road tolls, raiders, faction pressure, and haunted sites keep tensions active.",
+            "tone_and_themes": "The tone is rugged, grounded, and suspicious of easy victories.",
+            "generation_boundaries": "Specific places, NPC biographies, quest hooks, item details, resolved relationships, tactical encounters, and faction rosters belong in later steps.",
+        },
+    )
 
 
 def test_npc_personality_aliases_are_canonicalized():
@@ -54,6 +73,25 @@ def test_npc_personality_aliases_are_canonicalized():
     )
 
     assert npc.personality == ["stable", "pragmatic", "empathetic"]
+
+
+def test_region_description_is_rendered_from_identity_sections():
+    region = sample_region()
+    heading_positions = [region.description.index(f"## {heading}") for _, heading in REGION_IDENTITY_HEADINGS]
+
+    assert region.description.startswith("# The Test Frontier")
+    assert heading_positions == sorted(heading_positions)
+    assert "## Overview" in region.description
+    assert "## Generation Boundaries" in region.description
+
+
+def test_legacy_region_payload_derives_structured_identity():
+    region = RegionDraft.model_validate({"name": "Legacy Road", "description": "A contested road frontier. Older prose."})
+
+    assert region.summary == "A contested road frontier."
+    assert region.identity.overview == "A contested road frontier."
+    assert "## Overview" in region.description
+    assert "## Generation Boundaries" in region.description
 
 
 def sample_world_draft() -> WorldDraft:
@@ -150,10 +188,7 @@ def sample_world_draft() -> WorldDraft:
     )
     return WorldDraft(
         title="Test Frontier",
-        region=RegionDraft(
-            name="The Test Frontier",
-            description="A generated test frontier.",
-        ),
+        region=sample_region(),
         places=places,
         factions=factions,
         npcs=npcs,
@@ -438,6 +473,74 @@ def test_restart_generation_job_rejects_non_failed_jobs(tmp_path, monkeypatch):
         restart_generation_job("gen-done", sample_model())
 
 
+def test_retry_generation_job_step_resets_failed_npc_batch_and_downstream(tmp_path, monkeypatch):
+    db_path = tmp_path / "world.sqlite3"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    init_db()
+    insert_generation_job("gen-retry-npc", "failed")
+    asyncio.run(update_job_step("gen-retry-npc", "region", "done", {"attempts": 1, "parsed_payload": {"title": "World", "region": {"name": "Region", "description": "Desc"}}}))
+    asyncio.run(update_job_step("gen-retry-npc", "factions", "done", {"attempts": 1, "parsed_payload": {"factions": []}}))
+    asyncio.run(update_job_step("gen-retry-npc", "location_plan", "done", {"attempts": 1, "parsed_payload": {"batches": [], "slots": []}}))
+    asyncio.run(update_job_step("gen-retry-npc", "villages_places", "done", {"attempts": 1, "parsed_payload": {"places": []}}))
+    asyncio.run(update_job_step("gen-retry-npc", "character_diagram", "done", {"attempts": 1, "parsed_payload": {"clusters": [], "slots": [], "relationships": []}}))
+    asyncio.run(update_job_step("gen-retry-npc", "npcs_place_1", "done", {"attempts": 1, "parsed_payload": {"npcs": [{"ref": "npc-ok"}]}}))
+    asyncio.run(update_job_step("gen-retry-npc", "npcs_place_2", "failed", {"attempts": 3, "error": "Bad NPC", "raw_response": "{bad}"}))
+    asyncio.run(update_job_step("gen-retry-npc", "npcs_place_3", "failed", {"attempts": 1, "error": "Cancelled sibling"}))
+    asyncio.run(update_job_step("gen-retry-npc", "npcs", "failed", {"attempts": 0, "error": "Bad NPC", "parsed_payload": {"npcs": [{"ref": "stale"}]}}))
+    asyncio.run(update_job_step("gen-retry-npc", "relationships", "done", {"attempts": 1, "parsed_payload": {"relationships": [{"ref": "stale"}]}}))
+    asyncio.run(update_job_step("gen-retry-npc", "relationships_place_1", "done", {"attempts": 1, "parsed_payload": {"relationships": [{"ref": "stale"}]}}))
+
+    retry_model = ConfiguredModel(
+        id="openrouter:retry-model",
+        label="Retry Model",
+        provider="openrouter",
+        model_name="retry-model",
+    )
+    job = retry_generation_job_step("gen-retry-npc", "npcs_place_2", retry_model)
+
+    assert job is not None
+    assert job["status"] == "pending"
+    assert job["provider"] == "openrouter"
+    assert job["model_name"] == "retry-model"
+    assert job["resume_step_name"] == "npcs_place_2"
+    steps = {step["step_name"]: step for step in job["steps"]}
+    assert steps["npcs_place_1"]["status"] == "done"
+    assert json.loads(steps["npcs_place_1"]["parsed_payload"]) == {"npcs": [{"ref": "npc-ok"}]}
+    assert steps["npcs_place_2"]["status"] == "pending"
+    assert steps["npcs_place_2"]["attempts"] == 0
+    assert steps["npcs_place_2"]["error"] == ""
+    assert steps["npcs_place_3"]["status"] == "pending"
+    assert steps["npcs_place_3"]["error"] == ""
+    assert steps["npcs"]["status"] == "pending"
+    assert steps["npcs"]["parsed_payload"] == ""
+    assert steps["relationships"]["status"] == "pending"
+    assert steps["relationships_place_1"]["status"] == "pending"
+
+
+def test_retry_generation_job_step_rejects_invalid_requests(tmp_path, monkeypatch):
+    db_path = tmp_path / "world.sqlite3"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    init_db()
+    insert_generation_job("gen-running-retry", "running")
+    asyncio.run(update_job_step("gen-running-retry", "npcs_place_1", "failed", {"attempts": 3, "error": "Bad NPC"}))
+    insert_generation_job("gen-failed-retry", "failed")
+    asyncio.run(update_job_step("gen-failed-retry", "npcs", "failed", {"attempts": 0, "error": "Bad NPC"}))
+    asyncio.run(update_job_step("gen-failed-retry", "npcs_place_1", "done", {"attempts": 1, "parsed_payload": {"npcs": []}}))
+    insert_generation_job("gen-missing-checkpoints", "failed")
+    asyncio.run(update_job_step("gen-missing-checkpoints", "npcs_place_1", "failed", {"attempts": 3, "error": "Bad NPC"}))
+
+    with pytest.raises(ValueError, match="Only failed generation jobs"):
+        retry_generation_job_step("gen-running-retry", "npcs_place_1", sample_model())
+    with pytest.raises(ValueError, match="Only failed batch steps"):
+        retry_generation_job_step("gen-failed-retry", "npcs", sample_model())
+    with pytest.raises(ValueError, match="Only failed batch steps"):
+        retry_generation_job_step("gen-failed-retry", "npcs_place_1", sample_model())
+    with pytest.raises(ValueError, match="not found"):
+        retry_generation_job_step("gen-failed-retry", "npcs_missing", sample_model())
+    with pytest.raises(ValueError, match="checkpoint"):
+        retry_generation_job_step("gen-missing-checkpoints", "npcs_place_1", sample_model())
+
+
 def test_restart_generation_job_api_uses_requested_model(tmp_path, monkeypatch):
     import api
 
@@ -496,6 +599,43 @@ def test_restart_generation_job_api_uses_requested_query_model(tmp_path, monkeyp
     assert job["model_name"] == "google/gemma-4-26b-a4b-it:free"
 
 
+def test_retry_generation_job_step_api_uses_requested_model(tmp_path, monkeypatch):
+    import api
+
+    db_path = tmp_path / "world.sqlite3"
+    worlds_path = tmp_path / "worlds"
+    monkeypatch.setattr(settings, "database_path", str(db_path))
+    monkeypatch.setattr(settings, "worlds_dir", str(worlds_path))
+    RUNNING_TASKS.clear()
+    init_db()
+    insert_generation_job("gen-retry-api", "failed")
+    asyncio.run(update_job_step("gen-retry-api", "region", "done", {"attempts": 1, "parsed_payload": {"title": "World", "region": {"name": "Region", "description": "Desc"}}}))
+    asyncio.run(update_job_step("gen-retry-api", "factions", "done", {"attempts": 1, "parsed_payload": {"factions": []}}))
+    asyncio.run(update_job_step("gen-retry-api", "location_plan", "done", {"attempts": 1, "parsed_payload": {"batches": [], "slots": []}}))
+    asyncio.run(update_job_step("gen-retry-api", "villages_places", "done", {"attempts": 1, "parsed_payload": {"places": []}}))
+    asyncio.run(update_job_step("gen-retry-api", "character_diagram", "done", {"attempts": 1, "parsed_payload": {"clusters": [], "slots": [], "relationships": []}}))
+    asyncio.run(update_job_step("gen-retry-api", "npcs", "done", {"attempts": 1, "parsed_payload": {"npcs": []}}))
+    asyncio.run(update_job_step("gen-retry-api", "relationships_place_1", "failed", {"attempts": 3, "error": "Bad relationships"}))
+
+    async def skip_task_startup():
+        return None
+
+    monkeypatch.setattr(api, "ensure_generation_tasks", skip_task_startup)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/generation-jobs/gen-retry-api/steps/relationships_place_1/retry",
+            json={"model_id": "openrouter:minimax/minimax-m2.5:free"},
+        )
+
+    assert response.status_code == 202
+    job = response.json()["job"]
+    assert job["status"] == "pending"
+    assert job["resume_step_name"] == "relationships_place_1"
+    assert job["provider"] == "openrouter"
+    assert job["model_name"] == "minimax/minimax-m2.5:free"
+
+
 def test_world_insert_inserts_structured_data_and_lore(tmp_path):
     db_path = tmp_path / "world.sqlite3"
     worlds_path = tmp_path / "worlds"
@@ -510,6 +650,13 @@ def test_world_insert_inserts_structured_data_and_lore(tmp_path):
     assert count_rows(db_path, "npcs") >= 20
     assert count_rows(db_path, "npc_inventory_items") >= 20
     assert (worlds_path / world_id / "region.md").exists()
+    with sqlite3.connect(db_path) as conn:
+        region_summary = conn.execute("SELECT summary FROM regions WHERE world_id = ?", (world_id,)).fetchone()[0]
+    assert region_summary == draft.region.summary
+    assert region_summary != draft.region.description
+    region_lore = (worlds_path / world_id / "region.md").read_text(encoding="utf-8")
+    assert "## Overview" in region_lore
+    assert "## Generation Boundaries" in region_lore
     assert any((worlds_path / world_id / "places").iterdir())
     assert (worlds_path / world_id / "items").exists()
 

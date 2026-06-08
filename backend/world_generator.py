@@ -14,7 +14,11 @@ from database import db_session
 from item_catalog import NpcInventoryItem, load_staple_catalog_map, seed_npc_inventory
 from model_catalog import ConfiguredModel
 from providers import ProviderError
-from world_generation.pipeline import StepUpdater, build_world_draft as build_pipeline_world_draft
+from world_generation.pipeline import (
+    StepUpdater,
+    build_world_draft as build_pipeline_world_draft,
+    build_world_draft_from_job_steps as build_pipeline_world_draft_from_job_steps,
+)
 from world_generation.schemas import (
     PLACE_TYPES,
     WorldDraft,
@@ -36,6 +40,16 @@ def _entity_id(prefix: str) -> str:
 
 async def build_world_draft(prompt: str, model: ConfiguredModel, updater: Optional[StepUpdater] = None) -> tuple[WorldDraft, str, int]:
     return await build_pipeline_world_draft(prompt, model, updater)
+
+
+async def build_world_draft_from_job_steps(
+    prompt: str,
+    model: ConfiguredModel,
+    job_steps: list[dict[str, Any]],
+    retry_step_name: str,
+    updater: Optional[StepUpdater] = None,
+) -> tuple[WorldDraft, str, int]:
+    return await build_pipeline_world_draft_from_job_steps(prompt, model, job_steps, retry_step_name, updater)
 
 
 def validate_links(
@@ -192,7 +206,7 @@ def insert_world(
         )
         conn.execute(
             "INSERT INTO regions (id, world_id, name, summary, climate, danger_profile) VALUES (?, ?, ?, ?, ?, ?)",
-            (id_map["region_id"], world_id, draft.region.name, draft.region.description, "", ""),
+            (id_map["region_id"], world_id, draft.region.name, draft.region.summary, "", ""),
         )
         for faction in draft.factions:
             conn.execute(

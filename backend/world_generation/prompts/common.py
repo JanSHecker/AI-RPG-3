@@ -13,7 +13,9 @@ def feedback_block(previous_error: Optional[str], previous_response: Optional[st
     return (
         f"- Previous validation error: {previous_error[:2000]}\n"
         f"- Previous response excerpt:\n{(previous_response or '')[:2000]}\n"
-        "- Retry instruction: Fix the JSON so it exactly matches the requested schema and constraints."
+        "- Retry instruction: Fix the JSON so it exactly matches the requested schema and constraints. "
+        "Apply the previous validation error as a mandatory correction list; when it names a specific item, ref, field, "
+        "or invalid catalog value, change that exact value in the retry instead of making unrelated changes."
     )
 
 
@@ -29,7 +31,17 @@ def generation_shape() -> dict[str, int]:
 def region_shape() -> dict[str, Any]:
     return {
         "name": "string",
-        "description": "string",
+        "summary": "one short regional summary for database/API listings",
+        "identity": {
+            "overview": "region-wide premise and identity",
+            "geography": "major landforms, settlement pattern, and travel assumptions",
+            "climate": "weather, seasons, and environmental pressures",
+            "peoples_and_culture": "broad cultural assumptions and everyday life",
+            "power_centers": "high-level authorities, institutions, and influence blocs",
+            "current_conflicts": "broad tensions that later generation can localize",
+            "tone_and_themes": "genre tone, recurring motifs, and emotional texture",
+            "generation_boundaries": "what later generators should avoid placing in the region primer",
+        },
     }
 
 

@@ -32,6 +32,7 @@ from world_generation_jobs import (
     ensure_generation_tasks,
     get_generation_job,
     list_generation_jobs,
+    retry_generation_job_step,
     restart_generation_job,
 )
 from item_catalog import load_staple_catalog
@@ -264,6 +265,27 @@ async def api_restart_generation_job(
         raise HTTPException(status_code=400, detail="Selected model is not configured.")
     try:
         job = restart_generation_job(job_id, model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not job:
+        raise HTTPException(status_code=404, detail="Generation job not found.")
+    await ensure_generation_tasks()
+    return {"job": get_generation_job(job_id) or job}
+
+
+@router.post("/generation-jobs/{job_id}/steps/{step_name}/retry", status_code=202)
+async def api_retry_generation_job_step(
+    job_id: str,
+    step_name: str,
+    request: Optional[RestartGenerationJobRequest] = Body(default=None),
+    model_id: Optional[str] = None,
+):
+    selected_model_id = request.model_id if request and request.model_id else model_id
+    model = find_model(selected_model_id) if selected_model_id else resolve_active_model()
+    if not model:
+        raise HTTPException(status_code=400, detail="Selected model is not configured.")
+    try:
+        job = retry_generation_job_step(job_id, step_name, model)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if not job:

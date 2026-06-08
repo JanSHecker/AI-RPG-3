@@ -444,6 +444,42 @@ def _combined_transcript(batch_results: list[tuple[RelationshipBatch, list[Relat
     )
 
 
+def _cached_batch_payload(state, step_name: str) -> Optional[dict]:
+    if getattr(state, "retry_step_name", None) == step_name:
+        return None
+    return getattr(state, "cached_step_payloads", {}).get(step_name)
+
+
+def _cached_relationship_result(
+    state,
+    batch: RelationshipBatch,
+) -> Optional[tuple[RelationshipBatch, list[RelationshipDraft], StepTranscript]]:
+    payload = _cached_batch_payload(state, batch.step_name)
+    if payload is None:
+        return None
+    relationships = [RelationshipDraft.model_validate(relationship) for relationship in payload.get("relationships", [])]
+    if len(relationships) != batch.target_count:
+        raise ProviderError(f"Cached {batch.step_name} checkpoint has the wrong relationship count. Use full restart instead.")
+    _validate_relationships(
+        RelationshipsStep(relationships=relationships),
+        batch.places,
+        batch.factions,
+        batch.npcs,
+        batch.planned_relationships,
+        batch.target_count,
+    )
+    return (
+        batch,
+        relationships,
+        StepTranscript(
+            name=batch.step_name,
+            label=batch.label,
+            status="done",
+            parsed_payload={"relationships": [relationship.model_dump() for relationship in relationships]},
+        ),
+    )
+
+
 @step(name="relationships")
 async def run_step(state):
     if (
@@ -470,7 +506,21 @@ async def run_step(state):
 
     await update_step(state.updater, "relationships", "running", attempts=0, error="")
     try:
-        batch_results = await asyncio.gather(*[_generate_relationship_batch(state, batch) for batch in batches])
+        cached_results = [_cached_relationship_result(state, batch) for batch in batches]
+        missing_batches = [
+            batch
+            for batch, cached in zip(batches, cached_results)
+            if cached is None
+        ]
+        generated_results = await asyncio.gather(*[_generate_relationship_batch(state, batch) for batch in missing_batches])
+        generated_by_step_name = {
+            batch.step_name: (batch, relationships, transcript)
+            for batch, relationships, transcript in generated_results
+        }
+        batch_results = [
+            cached or generated_by_step_name[batch.step_name]
+            for batch, cached in zip(batches, cached_results)
+        ]
     except Exception as exc:
         message = str(exc)
         await update_step(state.updater, "relationships", "failed", attempts=0, error=message, raw_response="")

@@ -173,15 +173,50 @@ def _combined_transcript(batch_results: list[tuple[LocationPlanBatch, list[Place
     )
 
 
+def _cached_batch_payload(state, step_name: str) -> Optional[dict]:
+    if getattr(state, "retry_step_name", None) == step_name:
+        return None
+    return getattr(state, "cached_step_payloads", {}).get(step_name)
+
+
+def _cached_batch_result(state, batch: LocationPlanBatch) -> Optional[tuple[LocationPlanBatch, list[PlaceDraft], StepTranscript]]:
+    step_name = f"places_{batch.batch_id.replace('-', '_')}"
+    payload = _cached_batch_payload(state, step_name)
+    if payload is None:
+        return None
+    places = [PlaceDraft.model_validate(place) for place in payload.get("places", [])]
+    if len(places) != len(batch.slots):
+        raise ProviderError(f"Cached {step_name} checkpoint has the wrong place count. Use full restart instead.")
+    return (
+        batch,
+        places,
+        StepTranscript(
+            name=step_name,
+            label=_batch_label(batch, state.factions_step.factions),
+            status="done",
+            parsed_payload={"places": [place.model_dump() for place in places]},
+        ),
+    )
+
+
 @step(name="villages_places")
 async def run_step(state):
     if state.region_step is None or state.factions_step is None or state.location_plan_step is None:
         raise ProviderError("Region, factions, and location plan steps must complete before places generation.")
     await update_step(state.updater, "villages_places", "running", attempts=0, error="")
     try:
-        batch_results = await asyncio.gather(
-            *[_generate_batch(state, batch) for batch in state.location_plan_step.batches]
-        )
+        cached_results = [_cached_batch_result(state, batch) for batch in state.location_plan_step.batches]
+        missing_batches = [
+            batch
+            for batch, cached in zip(state.location_plan_step.batches, cached_results)
+            if cached is None
+        ]
+        generated_results = await asyncio.gather(*[_generate_batch(state, batch) for batch in missing_batches])
+        generated_by_batch_id = {batch.batch_id: (batch, places, transcript) for batch, places, transcript in generated_results}
+        batch_results = [
+            cached or generated_by_batch_id[batch.batch_id]
+            for batch, cached in zip(state.location_plan_step.batches, cached_results)
+        ]
         places = [place for _, batch_places, _ in batch_results for place in batch_places]
         _validate_places_against_plan(places, state.location_plan_step, state.factions_step.factions)
     except Exception as exc:

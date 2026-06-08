@@ -283,7 +283,7 @@ def _family_sizes(rng: random.Random) -> list[int]:
     while total < NPC_COUNT:
         size = pattern[len(sizes) % len(pattern)]
         size += rng.choice([-1, 0, 0, 1])
-        size = max(2, min(6, size))
+        size = max(2, min(MAX_NPC_BATCH_SIZE, size))
         if NPC_COUNT - total - size == 1:
             size += 1
         if total + size > NPC_COUNT:

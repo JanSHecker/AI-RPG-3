@@ -44,6 +44,23 @@ def sample_personalities(idx: int) -> list[str]:
     return [PERSONALITIES[(idx + offset) % len(PERSONALITIES)] for offset in range(3)]
 
 
+def sample_region() -> RegionDraft:
+    return RegionDraft(
+        name="Test Frontier",
+        summary="A rough frontier shaped by a broken road.",
+        identity={
+            "overview": "A rough frontier shaped by a broken road.",
+            "geography": "Hills, old roads, and scattered settlements define the region.",
+            "climate": "Cold rains and hard winds make travel unreliable.",
+            "peoples_and_culture": "Local families value roadcraft, repair work, and guarded hospitality.",
+            "power_centers": "Councils, wardens, and road-holding factions compete for legitimacy.",
+            "current_conflicts": "Control of the road strains villages, forts, and dangerous sites.",
+            "tone_and_themes": "The tone is grounded frontier fantasy with brittle loyalties.",
+            "generation_boundaries": "Specific places, NPC biographies, quest hooks, item details, resolved relationships, tactical encounters, and faction rosters belong in later steps.",
+        },
+    )
+
+
 def sample_world_draft() -> WorldDraft:
     places = [
         PlaceDraft(
@@ -126,10 +143,7 @@ def sample_world_draft() -> WorldDraft:
     ]
     return WorldDraft(
         title="Test Frontier",
-        region=RegionDraft(
-            name="Test Frontier",
-            description="A rough frontier.",
-        ),
+        region=sample_region(),
         places=places,
         factions=factions,
         npcs=npcs,
@@ -440,6 +454,19 @@ def test_faction_prompt_runs_before_places_and_requires_planning_notes():
     assert "source_name and target_name must exactly match names" in content
 
 
+def test_region_prompt_requires_structured_identity_sections():
+    from world_generation.prompts import create_region
+
+    messages = create_region.build_messages("A frontier under a broken road")
+    content = messages[-1]["content"]
+
+    assert "structured region identity" in content
+    assert "peoples_and_culture" in content
+    assert "generation_boundaries" in content
+    assert "do not write Markdown" in content
+    assert "must not contain specific place records, NPC biographies, quest hooks, item details" in content
+
+
 def test_location_plan_is_stable_clustered_and_counted():
     from world_generation.prompts import create_location_plan
 
@@ -691,6 +718,203 @@ def test_relationship_generation_runs_parallel_batches_and_merges(monkeypatch):
     assert result.step_transcripts[-1].name == "relationships"
 
 
+def test_relationship_resume_reuses_cached_sibling_batches(monkeypatch):
+    from world_generation.agent_workflows import build_world_draft_from_job_steps
+    from world_generation.prompts import create_relationships
+    from world_generation.step_runtime import StepTranscript
+
+    world = sample_world_draft()
+    plan = sample_location_plan(world)
+    diagram = sample_character_diagram(world)
+    batches = create_relationships._build_relationship_batches(
+        segments=[],
+        places=world.places,
+        factions=world.factions,
+        npcs=world.npcs,
+        planned_relationships=diagram.relationships,
+        relationship_opportunities=[],
+        target_count=RELATIONSHIP_TARGET_COUNT,
+    )
+    retry_batch = batches[0]
+    calls = []
+
+    def relationships_for_batch(batch):
+        relationships = [
+            RelationshipDraft(
+                ref=planned.ref,
+                source_type="npc",
+                source_ref=planned.source_ref,
+                target_type="npc",
+                target_ref=planned.target_ref,
+                relation_type=planned.relation_type,
+                description=planned.description,
+            )
+            for planned in batch.planned_relationships
+        ]
+        idx = 0
+        while len(relationships) < batch.target_count:
+            npc = batch.npcs[idx % len(batch.npcs)]
+            place = batch.places[idx % len(batch.places)]
+            relationships.append(
+                RelationshipDraft(
+                    ref=f"rel-resume-{batch.ref.replace(':', '-')}-{idx + 1:03d}",
+                    source_type="npc",
+                    source_ref=npc.ref,
+                    target_type="place",
+                    target_ref=place.ref,
+                    relation_type="local tie",
+                    description=f"{npc.ref} is locally tied to {place.ref}.",
+                )
+            )
+            idx += 1
+        return relationships
+
+    async def fake_generate_relationship_batch(state, batch):
+        calls.append(batch.step_name)
+        relationships = relationships_for_batch(batch)
+        return batch, relationships, StepTranscript(
+            name=batch.step_name,
+            label=batch.label,
+            status="done",
+            latency_ms=5,
+            parsed_payload={"relationships": [relationship.model_dump() for relationship in relationships]},
+        )
+
+    monkeypatch.setattr(create_relationships, "_generate_relationship_batch", fake_generate_relationship_batch)
+    character_payload = {
+        **diagram.model_dump(),
+        "character_segments": [],
+        "relationship_opportunities": [],
+    }
+    job_steps = [
+        {"step_name": "region", "status": "done", "parsed_payload": {"title": world.title, "region": world.region.model_dump()}},
+        {"step_name": "factions", "status": "done", "parsed_payload": {"factions": [faction.model_dump() for faction in world.factions]}},
+        {"step_name": "location_plan", "status": "done", "parsed_payload": plan.model_dump()},
+        {"step_name": "villages_places", "status": "done", "parsed_payload": {"places": [place.model_dump() for place in world.places]}},
+        {"step_name": "character_diagram", "status": "done", "parsed_payload": character_payload},
+        {"step_name": "npcs", "status": "done", "parsed_payload": {"npcs": [npc.model_dump() for npc in world.npcs]}},
+    ]
+    job_steps.extend(
+        {
+            "step_name": batch.step_name,
+            "status": "done",
+            "parsed_payload": {"relationships": [relationship.model_dump() for relationship in relationships_for_batch(batch)]},
+        }
+        for batch in batches[1:]
+    )
+
+    draft, _, _ = asyncio.run(
+        build_world_draft_from_job_steps(
+            "Frontier",
+            sample_model(),
+            job_steps,
+            retry_batch.step_name,
+        )
+    )
+
+    assert calls == [retry_batch.step_name]
+    assert len(draft.relationships) == RELATIONSHIP_TARGET_COUNT
+
+
+def test_relationship_resume_reruns_incomplete_sibling_batches(monkeypatch):
+    from world_generation.agent_workflows import build_world_draft_from_job_steps
+    from world_generation.prompts import create_relationships
+    from world_generation.step_runtime import StepTranscript
+
+    world = sample_world_draft()
+    plan = sample_location_plan(world)
+    diagram = sample_character_diagram(world)
+    batches = create_relationships._build_relationship_batches(
+        segments=[],
+        places=world.places,
+        factions=world.factions,
+        npcs=world.npcs,
+        planned_relationships=diagram.relationships,
+        relationship_opportunities=[],
+        target_count=RELATIONSHIP_TARGET_COUNT,
+    )
+    retry_batch = batches[0]
+    incomplete_sibling = batches[1]
+    calls = []
+
+    def relationships_for_batch(batch):
+        relationships = [
+            RelationshipDraft(
+                ref=planned.ref,
+                source_type="npc",
+                source_ref=planned.source_ref,
+                target_type="npc",
+                target_ref=planned.target_ref,
+                relation_type=planned.relation_type,
+                description=planned.description,
+            )
+            for planned in batch.planned_relationships
+        ]
+        idx = 0
+        while len(relationships) < batch.target_count:
+            npc = batch.npcs[idx % len(batch.npcs)]
+            place = batch.places[idx % len(batch.places)]
+            relationships.append(
+                RelationshipDraft(
+                    ref=f"rel-incomplete-sibling-{batch.ref.replace(':', '-')}-{idx + 1:03d}",
+                    source_type="npc",
+                    source_ref=npc.ref,
+                    target_type="place",
+                    target_ref=place.ref,
+                    relation_type="local tie",
+                    description=f"{npc.ref} is locally tied to {place.ref}.",
+                )
+            )
+            idx += 1
+        return relationships
+
+    async def fake_generate_relationship_batch(state, batch):
+        calls.append(batch.step_name)
+        relationships = relationships_for_batch(batch)
+        return batch, relationships, StepTranscript(
+            name=batch.step_name,
+            label=batch.label,
+            status="done",
+            latency_ms=5,
+            parsed_payload={"relationships": [relationship.model_dump() for relationship in relationships]},
+        )
+
+    monkeypatch.setattr(create_relationships, "_generate_relationship_batch", fake_generate_relationship_batch)
+    character_payload = {
+        **diagram.model_dump(),
+        "character_segments": [],
+        "relationship_opportunities": [],
+    }
+    job_steps = [
+        {"step_name": "region", "status": "done", "parsed_payload": {"title": world.title, "region": world.region.model_dump()}},
+        {"step_name": "factions", "status": "done", "parsed_payload": {"factions": [faction.model_dump() for faction in world.factions]}},
+        {"step_name": "location_plan", "status": "done", "parsed_payload": plan.model_dump()},
+        {"step_name": "villages_places", "status": "done", "parsed_payload": {"places": [place.model_dump() for place in world.places]}},
+        {"step_name": "character_diagram", "status": "done", "parsed_payload": character_payload},
+        {"step_name": "npcs", "status": "done", "parsed_payload": {"npcs": [npc.model_dump() for npc in world.npcs]}},
+    ]
+    job_steps.extend(
+        {
+            "step_name": batch.step_name,
+            "status": "done",
+            "parsed_payload": {"relationships": [relationship.model_dump() for relationship in relationships_for_batch(batch)]},
+        }
+        for batch in batches[2:]
+    )
+
+    draft, _, _ = asyncio.run(
+        build_world_draft_from_job_steps(
+            "Frontier",
+            sample_model(),
+            job_steps,
+            retry_batch.step_name,
+        )
+    )
+
+    assert calls == [retry_batch.step_name, incomplete_sibling.step_name]
+    assert len(draft.relationships) == RELATIONSHIP_TARGET_COUNT
+
+
 def test_final_relationship_validation_rejects_duplicate_refs():
     from world_generation.prompts import create_relationships
 
@@ -806,7 +1030,7 @@ def test_place_generation_rejects_duplicate_or_missing_plan_refs(monkeypatch):
         asyncio.run(create_village.run_step(state))
 
 
-def test_npc_generation_retries_unknown_faction_ref(monkeypatch):
+def test_npc_generation_merges_fixed_slot_fields(monkeypatch):
     from world_generation import step_runtime
     from world_generation.prompts import create_npc
 
@@ -821,21 +1045,19 @@ def test_npc_generation_retries_unknown_faction_ref(monkeypatch):
         role_hint="local warden",
         cluster_ref=f"cluster-{place.ref}",
     )
-    invalid_npc = world.npcs[0].model_copy(
+    generated_npc = world.npcs[0].model_copy(
         update={
             "ref": planned_slot.ref,
-            "faction_ref": "golden-court",
-            "home_place_ref": place.ref,
-            "current_place_ref": place.ref,
+            "faction_ref": "ignored-extra-faction",
+            "home_place_ref": "ignored-home",
+            "current_place_ref": "ignored-current",
         }
     )
-    valid_npc = invalid_npc.model_copy(update={"faction_ref": None})
     calls = []
 
     async def fake_complete_json(*, model, step_name, schema, messages):
         calls.append(messages[-1]["content"])
-        npc = invalid_npc if len(calls) == 1 else valid_npc
-        return (json.dumps({"npcs": [npc.model_dump()]}), 5)
+        return (json.dumps({"npcs": [generated_npc.model_dump()]}), 5)
 
     monkeypatch.setattr(step_runtime.CHAT_ADAPTER, "complete_json", fake_complete_json)
     state = SimpleNamespace(
@@ -850,11 +1072,15 @@ def test_npc_generation_retries_unknown_faction_ref(monkeypatch):
     npcs, transcript = asyncio.run(create_npc._generate_place_batch(state, place, [planned_slot]))
 
     assert npcs[0].faction_ref is None
-    assert len(calls) == 2
-    assert "golden-court" in calls[1]
-    assert "changed faction_ref" in calls[1]
-    assert transcript.attempts[0].status == "failed"
-    assert transcript.attempts[1].status == "done"
+    assert npcs[0].home_place_ref == place.ref
+    assert npcs[0].current_place_ref == place.ref
+    assert len(calls) == 1
+    assert "Do not output home_place_ref, current_place_ref, faction_ref" in calls[0]
+    required_shape = calls[0].split("Required JSON shape:\n", 1)[1].split("\n\nAllowed personality values:", 1)[0]
+    assert "faction_ref" not in required_shape
+    assert "home_place_ref" not in required_shape
+    assert "current_place_ref" not in required_shape
+    assert transcript.attempts[0].status == "done"
 
 
 def test_npc_prompt_uses_numeric_age_range_for_planned_slots():

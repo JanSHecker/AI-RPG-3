@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS generation_jobs (
     status TEXT NOT NULL,
     world_id TEXT,
     error TEXT NOT NULL DEFAULT '',
+    resume_step_name TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     started_at TEXT,
@@ -199,6 +200,13 @@ def connect(path: Optional[Path] = None) -> sqlite3.Connection:
 def init_db(path: Optional[Path] = None) -> None:
     with connect(path) as conn:
         conn.executescript(SCHEMA)
+        generation_job_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(generation_jobs)").fetchall()
+        }
+        if "resume_step_name" not in generation_job_columns:
+            conn.execute("ALTER TABLE generation_jobs ADD COLUMN resume_step_name TEXT")
+
         generation_step_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(generation_job_steps)").fetchall()

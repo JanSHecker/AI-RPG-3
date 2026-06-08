@@ -9,7 +9,7 @@ from typing import Any, Optional
 from database import db_session
 from model_catalog import ConfiguredModel
 from world_generation.pipeline import STEP_LABELS
-from world_generator import build_world_draft, insert_world, validate_links
+from world_generator import build_world_draft, build_world_draft_from_job_steps, insert_world, validate_links
 
 
 RUNNING_TASKS: dict[str, asyncio.Task] = {}
@@ -74,8 +74,8 @@ def create_generation_job(prompt: str, model: ConfiguredModel) -> dict[str, Any]
     timestamp = now_iso()
     with db_session() as conn:
         conn.execute(
-            "INSERT INTO generation_jobs (id, prompt, provider, model_name, status, world_id, error, created_at, updated_at, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (job_id, prompt, model.provider, model.model_name, "pending", None, "", timestamp, timestamp, None, None),
+            "INSERT INTO generation_jobs (id, prompt, provider, model_name, status, world_id, error, resume_step_name, created_at, updated_at, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, prompt, model.provider, model.model_name, "pending", None, "", None, timestamp, timestamp, None, None),
         )
         for step_name, label in STEP_LABELS.items():
             conn.execute(
@@ -104,6 +104,7 @@ def restart_generation_job(job_id: str, model: ConfiguredModel) -> Optional[dict
                 model_name = ?,
                 world_id = NULL,
                 error = '',
+                resume_step_name = NULL,
                 updated_at = ?,
                 started_at = NULL,
                 finished_at = NULL
@@ -127,6 +128,139 @@ def restart_generation_job(job_id: str, model: ConfiguredModel) -> Optional[dict
             """,
             (job_id,),
         )
+    return get_generation_job(job_id)
+
+
+def _retry_parent_and_downstream(step_name: str) -> tuple[str, list[str], list[str]]:
+    if step_name.startswith("places_"):
+        return (
+            "villages_places",
+            ["villages_places", "character_diagram", "npcs", "relationships"],
+            ["npcs_", "relationships_"],
+        )
+    if step_name.startswith("npcs_"):
+        return ("npcs", ["npcs", "relationships"], ["relationships_"])
+    if step_name.startswith("relationships_"):
+        return ("relationships", ["relationships"], [])
+    raise ValueError("Only failed batch steps can be retried.")
+
+
+def _required_resume_checkpoints(step_name: str) -> list[str]:
+    base = ["region", "factions", "location_plan"]
+    if step_name.startswith("places_"):
+        return base
+    base.extend(["villages_places", "character_diagram"])
+    if step_name.startswith("npcs_"):
+        return base
+    base.append("npcs")
+    return base
+
+
+def _validate_resume_checkpoints(conn, job_id: str, step_name: str) -> None:
+    required = _required_resume_checkpoints(step_name)
+    placeholders = ",".join("?" for _ in required)
+    rows = conn.execute(
+        f"SELECT step_name, status, parsed_payload FROM generation_job_steps WHERE job_id = ? AND step_name IN ({placeholders})",
+        [job_id, *required],
+    ).fetchall()
+    by_name = {row["step_name"]: row for row in rows}
+    missing = [
+        name
+        for name in required
+        if name not in by_name or by_name[name]["status"] != "done" or not by_name[name]["parsed_payload"]
+    ]
+    if missing:
+        raise ValueError(f"Cannot resume this job because checkpoint(s) are missing: {', '.join(missing)}. Use full restart instead.")
+
+
+def retry_generation_job_step(job_id: str, step_name: str, model: ConfiguredModel) -> Optional[dict[str, Any]]:
+    parent_step, aggregate_steps, downstream_prefixes = _retry_parent_and_downstream(step_name)
+    timestamp = now_iso()
+    with db_session() as conn:
+        job = conn.execute("SELECT status FROM generation_jobs WHERE id = ?", (job_id,)).fetchone()
+        if not job:
+            return None
+        if job["status"] != "failed":
+            raise ValueError("Only failed generation jobs can retry a batch step.")
+        step = conn.execute(
+            "SELECT status FROM generation_job_steps WHERE job_id = ? AND step_name = ?",
+            (job_id, step_name),
+        ).fetchone()
+        if not step:
+            raise ValueError("Generation batch step not found.")
+        if step["status"] != "failed":
+            raise ValueError("Only failed batch steps can be retried.")
+        _validate_resume_checkpoints(conn, job_id, step_name)
+
+        conn.execute(
+            """
+            UPDATE generation_jobs
+            SET status = 'pending',
+                provider = ?,
+                model_name = ?,
+                world_id = NULL,
+                error = '',
+                resume_step_name = ?,
+                updated_at = ?,
+                started_at = NULL,
+                finished_at = NULL
+            WHERE id = ?
+            """,
+            (model.provider, model.model_name, step_name, timestamp, job_id),
+        )
+
+        reset_exact = [step_name, *aggregate_steps]
+        placeholders = ",".join("?" for _ in reset_exact)
+        conn.execute(
+            f"""
+            UPDATE generation_job_steps
+            SET status = 'pending',
+                attempts = 0,
+                error = '',
+                prompt_messages = '[]',
+                raw_response = '',
+                parsed_payload = '',
+                latency_ms = NULL,
+                started_at = NULL,
+                finished_at = NULL
+            WHERE job_id = ? AND step_name IN ({placeholders})
+            """,
+            [job_id, *reset_exact],
+        )
+        batch_prefix = step_name.split("_", 1)[0] + "_"
+        conn.execute(
+            """
+            UPDATE generation_job_steps
+            SET status = 'pending',
+                attempts = 0,
+                error = '',
+                prompt_messages = '[]',
+                raw_response = '',
+                parsed_payload = '',
+                latency_ms = NULL,
+                started_at = NULL,
+                finished_at = NULL
+            WHERE job_id = ? AND step_name LIKE ? AND status != 'done'
+            """,
+            (job_id, f"{batch_prefix}%"),
+        )
+        for prefix in downstream_prefixes:
+            conn.execute(
+                """
+                UPDATE generation_job_steps
+                SET status = 'pending',
+                    attempts = 0,
+                    error = '',
+                    prompt_messages = '[]',
+                    raw_response = '',
+                    parsed_payload = '',
+                    latency_ms = NULL,
+                    started_at = NULL,
+                    finished_at = NULL
+                WHERE job_id = ? AND step_name LIKE ?
+                """,
+                (job_id, f"{prefix}%"),
+            )
     return get_generation_job(job_id)
 
 
@@ -218,12 +352,13 @@ def update_job_status(job_id: str, status: str, *, error: str = "", world_id: Op
             SET status = ?,
                 error = ?,
                 world_id = COALESCE(?, world_id),
+                resume_step_name = CASE WHEN ? IN ('done', 'failed') THEN NULL ELSE resume_step_name END,
                 updated_at = ?,
                 started_at = COALESCE(started_at, ?),
                 finished_at = ?
             WHERE id = ?
             """,
-            (status, error, world_id, timestamp, started_at, finished_at, job_id),
+            (status, error, world_id, status, timestamp, started_at, finished_at, job_id),
         )
 
 
@@ -345,7 +480,16 @@ async def _run_generation_job(job_id: str) -> None:
         async def updater(step_name: str, status: str, payload: dict[str, Any]) -> None:
             await update_job_step(job_id, step_name, status, payload)
 
-        draft, raw_response, latency_ms = await build_world_draft(job["prompt"], model, updater)
+        if job.get("resume_step_name"):
+            draft, raw_response, latency_ms = await build_world_draft_from_job_steps(
+                job["prompt"],
+                model,
+                job.get("steps") or [],
+                job["resume_step_name"],
+                updater,
+            )
+        else:
+            draft, raw_response, latency_ms = await build_world_draft(job["prompt"], model, updater)
         validate_links(draft)
         if not get_generation_job(job_id):
             return

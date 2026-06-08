@@ -1,14 +1,15 @@
 import asyncio
 from typing import Optional
 
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, Field, create_model, field_validator
 
 from providers import ProviderError
 from world_generation.agent_framework_compat import step
-from world_generation.prompts.common import feedback_block, npc_shape, render_json_block
+from world_generation.prompts.common import feedback_block, render_json_block
 from world_generation.schemas import (
     NPC_COUNT,
     PERSONALITIES,
+    PERSONALITY_ALIASES,
     CharacterSegmentDraft,
     CharacterSlotDraft,
     FactionDraft,
@@ -29,6 +30,23 @@ class NPCStep(BaseModel):
     npcs: list[NpcDraft] = Field(min_length=NPC_COUNT, max_length=NPC_COUNT)
 
 
+class GeneratedNpcDraft(BaseModel):
+    ref: str
+    name: str
+    age: int = Field(ge=12, le=95)
+    personality: list[str] = Field(min_length=3, max_length=3)
+    job: str
+    status: str
+    lore: str
+
+    @field_validator("personality", mode="before")
+    @classmethod
+    def normalize_personality_aliases(cls, value: object) -> object:
+        if not isinstance(value, list):
+            return value
+        return [PERSONALITY_ALIASES.get(entry, entry) if isinstance(entry, str) else entry for entry in value]
+
+
 AGE_BAND_RANGES = {
     "child": (12, 14),
     "teen": (15, 19),
@@ -41,8 +59,20 @@ AGE_BAND_RANGES = {
 def _batch_schema(batch_size: int) -> type[BaseModel]:
     return create_model(
         f"NPCBatchStep_{batch_size}",
-        npcs=(list[NpcDraft], Field(min_length=batch_size, max_length=batch_size)),
+        npcs=(list[GeneratedNpcDraft], Field(min_length=batch_size, max_length=batch_size)),
     )
+
+
+def _generated_npc_shape() -> dict:
+    return {
+        "ref": "npc-slot-kebab-case",
+        "name": "string",
+        "age": 30,
+        "personality": PERSONALITIES[:3],
+        "job": "warden",
+        "status": "active",
+        "lore": "# NPC Name\n\nMarkdown lore.",
+    }
 
 
 def _slot_prompt_payload(slot: CharacterSlotDraft) -> dict:
@@ -111,13 +141,9 @@ def build_messages(
     previous_response: Optional[str] = None,
 ) -> list[dict[str, str]]:
     retry_feedback = feedback_block(previous_error, previous_response)
-    allowed_faction_refs = [faction.ref for faction in factions]
     allowed_personalities = PERSONALITIES
     planned_refs = [slot.ref for slot in planned_slots]
-    npc_example = npc_shape()
-    npc_example["faction_ref"] = None
-    npc_example["home_place_ref"] = primary_place.ref
-    npc_example["current_place_ref"] = nearby_places[0].ref if nearby_places else primary_place.ref
+    npc_example = _generated_npc_shape()
     prompt_body = f"""
 
 Region:
@@ -145,7 +171,7 @@ Generation segment:
 {render_json_block(segment.model_dump() if segment else None)}
 
 Task:
-Create NPCs for this family/heritage graph segment from the planned character slots. Return JSON with npcs only.
+Create generated NPC details for this family/heritage graph segment from the planned character slots. Return JSON with npcs only.
 
 Target count:
 {len(planned_slots)}
@@ -153,19 +179,15 @@ Target count:
 Required JSON shape:
 {render_json_block({"npcs": [npc_example]})}
 
-Allowed faction_ref values:
-{render_json_block(allowed_faction_refs)}
-
 Allowed personality values:
 {render_json_block(allowed_personalities)}
 
 Constraints:
 - Return exactly the requested number of npcs.
 - Each npc ref must exactly match one planned slot ref. Planned refs are {render_json_block(planned_refs)}.
-- home_place_ref, current_place_ref, and faction_ref must exactly match the planned slot values.
+- Do not output home_place_ref, current_place_ref, faction_ref, age_band, role_hint, or cluster_ref; those fields are already fixed by the planned character slots and the backend will combine them after generation.
 - age must be within the planned slot age_range, inclusive.
-- personality must be exactly 3 unique values from the allowed personality values list.
-- Do not invent personality synonyms. For example, use "stable" instead of "steady" and "empathetic" instead of "sensitive".
+- personality must be exactly 3 different values from the allowed personality values list. Do use the exact allowed names for personalities. No synonyms or made-up personalities.
 - Use role_hint, cluster_ref, and planned relationships as strong guidance for job, personality, and lore.
 - Keep the cast grounded in the local life of the primary place while honoring cross-place family context.
 - Relationship opportunities are context only; they may inspire lore, but do not output relationship records.
@@ -202,31 +224,37 @@ def _prepare_and_validate_npc_batch(parsed: BaseModel, planned_slots: list[Chara
 def _validate_npc_batch(parsed: BaseModel, planned_slots: list[CharacterSlotDraft], factions: list[FactionDraft]) -> None:
     planned_by_ref = {slot.ref: slot for slot in planned_slots}
     expected_refs = set(planned_by_ref)
-    allowed_faction_refs = {faction.ref for faction in factions}
     allowed_personalities = set(PERSONALITIES)
     seen_refs = {npc.ref for npc in parsed.npcs}
     if seen_refs != expected_refs:
         raise ValueError(f"NPC batch refs must exactly match planned refs. Missing: {sorted(expected_refs - seen_refs)}. Extra: {sorted(seen_refs - expected_refs)}.")
     for npc in parsed.npcs:
         planned = planned_by_ref[npc.ref]
-        if npc.home_place_ref != planned.home_place_ref:
-            raise ValueError(f"NPC {npc.ref} changed home_place_ref from {planned.home_place_ref} to {npc.home_place_ref}.")
-        if npc.current_place_ref != planned.current_place_ref:
-            raise ValueError(f"NPC {npc.ref} changed current_place_ref from {planned.current_place_ref} to {npc.current_place_ref}.")
-        if npc.faction_ref != planned.faction_ref:
-            raise ValueError(f"NPC {npc.ref} changed faction_ref from {planned.faction_ref} to {npc.faction_ref}.")
-        if npc.faction_ref and npc.faction_ref not in allowed_faction_refs:
-            raise ValueError(
-                f"NPC {npc.ref} faction_ref must be null or one of {sorted(allowed_faction_refs)}; got {npc.faction_ref}."
-            )
         if not _age_matches_band(npc.age, planned.age_band):
             low, high = AGE_BAND_RANGES[planned.age_band]
             raise ValueError(f"NPC {npc.ref} age {npc.age} must be within planned age_range {low}-{high}.")
         invalid_personalities = [entry for entry in npc.personality if entry not in allowed_personalities]
+        if len(set(npc.personality)) != len(npc.personality):
+            raise ValueError(f"NPC {npc.ref} personality values must be exactly 3 different allowed personality catalog values.")
         if invalid_personalities:
             raise ValueError(
-                f"NPC {npc.ref} personality values must be from the personality catalog; got {invalid_personalities}."
+                f"NPC {npc.ref} has invalid personality value(s) {invalid_personalities} in personality {npc.personality}. "
+                "Change those exact invalid value(s) to different exact allowed personality catalog value(s); "
+                "keep valid personality values unchanged unless needed to preserve exactly 3 different values."
             )
+
+
+def _merge_generated_npc_batch(generated_npcs: list[GeneratedNpcDraft], planned_slots: list[CharacterSlotDraft]) -> list[NpcDraft]:
+    planned_by_ref = {slot.ref: slot for slot in planned_slots}
+    return [
+        NpcDraft(
+            **npc.model_dump(),
+            faction_ref=planned_by_ref[npc.ref].faction_ref,
+            home_place_ref=planned_by_ref[npc.ref].home_place_ref,
+            current_place_ref=planned_by_ref[npc.ref].current_place_ref,
+        )
+        for npc in generated_npcs
+    ]
 
 
 def _relationships_for_slots(slots: list[CharacterSlotDraft], relationships: list[PlannedRelationshipDraft]) -> list[PlannedRelationshipDraft]:
@@ -305,7 +333,7 @@ async def _generate_place_batch(
         ),
     )
     transcript.label = label
-    return parsed.npcs, transcript
+    return _merge_generated_npc_batch(parsed.npcs, planned_slots), transcript
 
 
 async def _generate_segment_batch(
@@ -350,7 +378,7 @@ async def _generate_segment_batch(
         ),
     )
     transcript.label = label
-    return segment, parsed.npcs, transcript
+    return segment, _merge_generated_npc_batch(parsed.npcs, planned_slots), transcript
 
 
 def _combined_transcript(batch_results: list[tuple[str, str, StepTranscript, list[NpcDraft]]]) -> StepTranscript:
@@ -391,6 +419,64 @@ def _combined_transcript(batch_results: list[tuple[str, str, StepTranscript, lis
     )
 
 
+def _cached_batch_payload(state, step_name: str) -> Optional[dict]:
+    if getattr(state, "retry_step_name", None) == step_name:
+        return None
+    return getattr(state, "cached_step_payloads", {}).get(step_name)
+
+
+def _is_full_npc_payload(raw_npcs: list[object]) -> bool:
+    required_fixed_fields = {"faction_ref", "home_place_ref", "current_place_ref"}
+    return all(isinstance(npc, dict) and required_fixed_fields.issubset(npc) for npc in raw_npcs)
+
+
+def _cached_npc_result(
+    state,
+    step_name: str,
+    label: str,
+    expected_count: int,
+    planned_slots: list[CharacterSlotDraft],
+) -> Optional[tuple[list[NpcDraft], StepTranscript]]:
+    payload = _cached_batch_payload(state, step_name)
+    if payload is None:
+        return None
+    raw_npcs = payload.get("npcs", [])
+    if len(raw_npcs) != expected_count:
+        raise ProviderError(f"Cached {step_name} checkpoint has the wrong NPC count. Use full restart instead.")
+
+    if _is_full_npc_payload(raw_npcs):
+        npcs = [NpcDraft.model_validate(npc) for npc in raw_npcs]
+    else:
+        generated_step = _batch_schema(expected_count).model_validate(payload)
+        _prepare_and_validate_npc_batch(generated_step, planned_slots, getattr(state.factions_step, "factions", []))
+        npcs = _merge_generated_npc_batch(generated_step.npcs, planned_slots)
+
+    return (
+        npcs,
+        StepTranscript(
+            name=step_name,
+            label=label,
+            status="done",
+            parsed_payload={"npcs": [npc.model_dump() for npc in npcs]},
+        ),
+    )
+
+
+def _cached_segment_npc_result(
+    state,
+    segment: CharacterSegmentDraft,
+    step_name: str,
+    label: str,
+    expected_count: int,
+    planned_slots: list[CharacterSlotDraft],
+) -> Optional[tuple[CharacterSegmentDraft, list[NpcDraft], StepTranscript]]:
+    cached = _cached_npc_result(state, step_name, label, expected_count, planned_slots)
+    if cached is None:
+        return None
+    npcs, transcript = cached
+    return segment, npcs, transcript
+
+
 @step(name="npcs")
 async def run_step(state):
     if state.region_step is None or state.places_step is None or state.factions_step is None or state.character_diagram_step is None:
@@ -421,12 +507,33 @@ async def run_step(state):
                 )
         await update_step(state.updater, "npcs", "running", attempts=0, error="")
         try:
-            place_batch_results = await asyncio.gather(
+            cached_results = [
+                _cached_npc_result(state, step_name, label, len(chunk), chunk)
+                for _, _, chunk, step_name, label in place_jobs
+            ]
+            missing_jobs = [
+                job
+                for job, cached in zip(place_jobs, cached_results)
+                if cached is None
+            ]
+            if getattr(state, "retry_step_name", None):
+                missing_step_names = {step_name for _, _, _, step_name, _ in missing_jobs}
+                if missing_step_names != {state.retry_step_name}:
+                    raise ProviderError("Cannot resume NPCs because one or more sibling batch checkpoints are missing. Use full restart instead.")
+            generated_results = await asyncio.gather(
                 *[
                     _generate_place_batch(state, place, chunk, step_name=step_name, label=label)
-                    for _, place, chunk, step_name, label in place_jobs
+                    for _, place, chunk, step_name, label in missing_jobs
                 ]
             )
+            generated_by_step_name = {
+                step_name: result
+                for (_, _, _, step_name, _), result in zip(missing_jobs, generated_results)
+            }
+            place_batch_results = [
+                cached or generated_by_step_name[step_name]
+                for (_, _, _, step_name, _), cached in zip(place_jobs, cached_results)
+            ]
         except Exception as exc:
             message = str(exc)
             await update_step(state.updater, "npcs", "failed", attempts=0, error=message, raw_response="")
@@ -478,7 +585,20 @@ async def run_step(state):
                 )
             )
     try:
-        batch_results = await asyncio.gather(
+        cached_results = [
+            _cached_segment_npc_result(state, segment, step_name, label, len(chunk), chunk)
+            for _, segment, chunk, step_name, label in segment_jobs
+        ]
+        missing_jobs = [
+            job
+            for job, cached in zip(segment_jobs, cached_results)
+            if cached is None
+        ]
+        if getattr(state, "retry_step_name", None):
+            missing_step_names = {step_name for _, _, _, step_name, _ in missing_jobs}
+            if missing_step_names != {state.retry_step_name}:
+                raise ProviderError("Cannot resume NPCs because one or more sibling batch checkpoints are missing. Use full restart instead.")
+        generated_results = await asyncio.gather(
             *[
                 _generate_segment_batch(
                     state,
@@ -487,9 +607,17 @@ async def run_step(state):
                     step_name=step_name,
                     label=label,
                 )
-                for _, segment, chunk, step_name, label in segment_jobs
+                for _, segment, chunk, step_name, label in missing_jobs
             ]
         )
+        generated_by_step_name = {
+            step_name: result
+            for (_, _, _, step_name, _), result in zip(missing_jobs, generated_results)
+        }
+        batch_results = [
+            cached or generated_by_step_name[step_name]
+            for (_, _, _, step_name, _), cached in zip(segment_jobs, cached_results)
+        ]
     except Exception as exc:
         message = str(exc)
         await update_step(state.updater, "npcs", "failed", attempts=0, error=message, raw_response="")

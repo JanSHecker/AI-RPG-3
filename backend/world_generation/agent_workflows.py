@@ -72,6 +72,8 @@ class WorldGenerationState:
     relationship_opportunities: list[RelationshipOpportunityDraft] = field(default_factory=list)
     npc_step: Optional[NPCStep] = None
     relationships_step: Optional[RelationshipsStep] = None
+    retry_step_name: Optional[str] = None
+    cached_step_payloads: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -158,6 +160,154 @@ async def build_world_draft(
         indent=2,
     )
     return draft, raw_response, latency_ms
+
+
+def _decode_payload(value: Any) -> Optional[dict[str, Any]]:
+    if not value:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return decoded if isinstance(decoded, dict) else None
+    return None
+
+
+def _payload_by_step(job_steps: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    payloads: dict[str, dict[str, Any]] = {}
+    for step in job_steps:
+        payload = _decode_payload(step.get("parsed_payload"))
+        if payload is not None and step.get("status") == "done":
+            payloads[step["step_name"]] = payload
+    return payloads
+
+
+def _require_payload(payloads: dict[str, dict[str, Any]], step_name: str) -> dict[str, Any]:
+    payload = payloads.get(step_name)
+    if payload is None:
+        raise ProviderError(
+            f"Cannot resume this job because checkpoint '{step_name}' is missing. Use full restart instead."
+        )
+    return payload
+
+
+def _state_from_checkpoints(
+    *,
+    prompt: str,
+    model: ConfiguredModel,
+    updater: Optional[StepUpdater],
+    retry_step_name: str,
+    payloads: dict[str, dict[str, Any]],
+) -> WorldGenerationState:
+    state = WorldGenerationState(
+        prompt=prompt,
+        model=model,
+        updater=updater,
+        retry_step_name=retry_step_name,
+        cached_step_payloads=payloads,
+    )
+    state.region_step = RegionStep.model_validate(_require_payload(payloads, "region"))
+    state.factions_step = FactionsStep.model_validate(_require_payload(payloads, "factions"))
+    state.location_plan_step = LocationPlanStep.model_validate(_require_payload(payloads, "location_plan"))
+
+    if retry_step_name.startswith("places_"):
+        return state
+
+    state.places_step = PlacesStep.model_validate(_require_payload(payloads, "villages_places"))
+    diagram_payload = _require_payload(payloads, "character_diagram")
+    state.character_diagram_step = CharacterDiagramStep.model_validate(diagram_payload)
+    state.character_segments = [
+        CharacterSegmentDraft.model_validate(segment)
+        for segment in diagram_payload.get("character_segments", [])
+    ]
+    state.relationship_opportunities = [
+        RelationshipOpportunityDraft.model_validate(opportunity)
+        for opportunity in diagram_payload.get("relationship_opportunities", [])
+    ]
+
+    if retry_step_name.startswith("npcs_"):
+        return state
+
+    state.npc_step = NPCStep.model_validate(_require_payload(payloads, "npcs"))
+    return state
+
+
+def _final_world_from_state(final_state: WorldGenerationState) -> WorldDraft:
+    if (
+        final_state.region_step is None
+        or final_state.places_step is None
+        or final_state.factions_step is None
+        or final_state.character_diagram_step is None
+        or final_state.npc_step is None
+        or final_state.relationships_step is None
+    ):
+        raise ProviderError("Workflow did not complete all world generation steps.")
+    return WorldDraft(
+        title=final_state.region_step.title,
+        region=final_state.region_step.region,
+        places=final_state.places_step.places,
+        factions=final_state.factions_step.factions,
+        npcs=final_state.npc_step.npcs,
+        relationships=final_state.relationships_step.relationships,
+    )
+
+
+def _raw_response_from_state(final_state: WorldGenerationState, draft: WorldDraft) -> str:
+    return json.dumps(
+        {
+            "pipeline_version": PIPELINE_VERSION,
+            "steps": transcript_payloads(final_state.step_transcripts),
+            "location_plan": final_state.location_plan_step.model_dump() if final_state.location_plan_step else None,
+            "character_diagram": final_state.character_diagram_step.model_dump() if final_state.character_diagram_step else None,
+            "character_segments": [segment.model_dump() for segment in final_state.character_segments],
+            "relationship_opportunities": [opportunity.model_dump() for opportunity in final_state.relationship_opportunities],
+            "final_world": draft.model_dump(),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+async def build_world_draft_from_job_steps(
+    prompt: str,
+    model: ConfiguredModel,
+    job_steps: list[dict[str, Any]],
+    retry_step_name: str,
+    updater: Optional[StepUpdater] = None,
+) -> tuple[WorldDraft, str, int]:
+    started = perf_counter()
+    if not (
+        retry_step_name.startswith("places_")
+        or retry_step_name.startswith("npcs_")
+        or retry_step_name.startswith("relationships_")
+    ):
+        raise ProviderError("Only place, NPC, and relationship batch steps can be resumed.")
+
+    state = _state_from_checkpoints(
+        prompt=prompt,
+        model=model,
+        updater=updater,
+        retry_step_name=retry_step_name,
+        payloads=_payload_by_step(job_steps),
+    )
+
+    if retry_step_name.startswith("places_"):
+        state = await create_village.run_step(state)
+        state = await create_character_diagram.run_step(state)
+        state = await create_npc.run_step(state)
+        state = await create_relationships.run_step(state)
+    elif retry_step_name.startswith("npcs_"):
+        state = await create_npc.run_step(state)
+        state = await create_relationships.run_step(state)
+    else:
+        state = await create_relationships.run_step(state)
+
+    draft = _final_world_from_state(state)
+    latency_ms = int((perf_counter() - started) * 1000)
+    return draft, _raw_response_from_state(state, draft), latency_ms
 
 
 async def build_world_items_draft(
